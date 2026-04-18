@@ -306,3 +306,780 @@ impl<V: IntrusiveNodeValue> Drop for IntrusiveListNode<V> {
         guard.unlink(self);
     }
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    // ── Test fixture ──────────────────────────────────────────────────────
+
+    enum TestNode {
+        Head { mutex: Mutex<i32> },
+        Leaf { target: *const IntrusiveListNode<TestNode>, id: i32 },
+    }
+
+    // SAFETY: The raw pointer in Leaf is only dereferenced while the head
+    // mutex is held.
+    unsafe impl Send for TestNode {}
+    unsafe impl Sync for TestNode {}
+
+    impl IntrusiveNodeValue for TestNode {
+        type HeadValue = i32;
+
+        fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, i32> {
+            match self {
+                TestNode::Head { mutex } => mutex.lock(),
+                TestNode::Leaf { .. } => panic!("lock_mutex called on leaf node"),
+            }
+        }
+
+        fn target_node(&self) -> Option<&IntrusiveListNode<Self>> {
+            match self {
+                TestNode::Head { .. } => None,
+                TestNode::Leaf { target, .. } => Some(unsafe { &**target }),
+            }
+        }
+    }
+
+    impl TestNode {
+        fn id(&self) -> i32 {
+            match self {
+                TestNode::Leaf { id, .. } => *id,
+                TestNode::Head { .. } => panic!("id() called on head node"),
+            }
+        }
+    }
+
+    fn make_head(val: i32) -> IntrusiveListNode<TestNode> {
+        IntrusiveListNode::new(TestNode::Head {
+            mutex: Mutex::new(val),
+        })
+    }
+
+    fn make_leaf(head: &IntrusiveListNode<TestNode>, id: i32) -> IntrusiveListNode<TestNode> {
+        IntrusiveListNode::new(TestNode::Leaf {
+            target: head as *const _,
+            id,
+        })
+    }
+
+    /// Collects the IDs of all linked leaf nodes in list order.
+    fn collect_ids(head: &IntrusiveListNode<TestNode>) -> Vec<i32> {
+        let guard = head.lock_head();
+        let mut ids = Vec::new();
+        guard.filter(|v| {
+            ids.push(v.id());
+            true
+        });
+        ids
+    }
+
+    fn node_is_linked(
+        head: &IntrusiveListNode<TestNode>,
+        node: &IntrusiveListNode<TestNode>,
+    ) -> bool {
+        let _guard = head.lock_head();
+        unsafe { node.is_linked() }
+    }
+
+    // ── Construction & basic state ────────────────────────────────────────
+
+    #[test]
+    fn new_head_is_not_linked() {
+        let head = make_head(0);
+        let guard = head.lock_head();
+        assert!(!unsafe { head.is_linked() });
+        drop(guard);
+    }
+
+    #[test]
+    fn new_leaf_is_not_linked() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        assert!(!node_is_linked(&head, &leaf));
+    }
+
+    #[test]
+    fn lock_head_from_head_returns_guard_with_value() {
+        let head = make_head(42);
+        let guard = head.lock_head();
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn lock_head_from_leaf_returns_guard_with_head_value() {
+        let head = make_head(42);
+        let leaf = make_leaf(&head, 1);
+        let guard = leaf.lock_head();
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn guard_deref_mut_writes_head_value() {
+        let head = make_head(0);
+        {
+            let mut guard = head.lock_head();
+            *guard = 123;
+        }
+        let guard = head.lock_head();
+        assert_eq!(*guard, 123);
+    }
+
+    // ── Link operations ───────────────────────────────────────────────────
+
+    #[test]
+    fn link_single_leaf() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&leaf);
+        }
+        assert!(node_is_linked(&head, &leaf));
+        assert_eq!(collect_ids(&head), vec![1]);
+    }
+
+    #[test]
+    fn link_two_leaves() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 2]);
+    }
+
+    #[test]
+    fn link_three_leaves_preserves_insertion_order() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 10);
+        let b = make_leaf(&head, 20);
+        let c = make_leaf(&head, 30);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+        }
+        assert_eq!(collect_ids(&head), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn link_already_linked_is_noop() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&a); // already linked — no-op
+        }
+        // Order unchanged, no duplicate.
+        assert_eq!(collect_ids(&head), vec![1, 2]);
+    }
+
+    #[test]
+    fn link_initializes_head_self_link() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        let guard = head.lock_head();
+        assert!(!unsafe { head.is_linked() });
+        guard.link(&leaf);
+        assert!(unsafe { head.is_linked() });
+    }
+
+    // ── Unlink operations ─────────────────────────────────────────────────
+
+    #[test]
+    fn unlink_single_leaf() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&leaf);
+            guard.unlink(&leaf);
+        }
+        assert!(!node_is_linked(&head, &leaf));
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn unlink_first_of_two_leaves() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.unlink(&a);
+        }
+        assert!(!node_is_linked(&head, &a));
+        assert!(node_is_linked(&head, &b));
+        assert_eq!(collect_ids(&head), vec![2]);
+    }
+
+    #[test]
+    fn unlink_last_of_two_leaves() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.unlink(&b);
+        }
+        assert!(node_is_linked(&head, &a));
+        assert!(!node_is_linked(&head, &b));
+        assert_eq!(collect_ids(&head), vec![1]);
+    }
+
+    #[test]
+    fn unlink_middle_of_three_leaves() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.unlink(&b);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 3]);
+    }
+
+    #[test]
+    fn unlink_not_linked_is_noop() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.unlink(&b); // b was never linked
+        }
+        assert_eq!(collect_ids(&head), vec![1]);
+    }
+
+    #[test]
+    fn unlink_head_tears_down_entire_list() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.unlink(&head);
+        }
+        assert!(!node_is_linked(&head, &a));
+        assert!(!node_is_linked(&head, &b));
+        assert!(!node_is_linked(&head, &c));
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn unlink_head_when_empty_is_safe() {
+        let head = make_head(0);
+        let guard = head.lock_head();
+        guard.unlink(&head); // no-op: head was never self-linked
+        drop(guard);
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn relink_after_unlink() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&leaf);
+            guard.unlink(&leaf);
+            guard.link(&leaf);
+        }
+        assert!(node_is_linked(&head, &leaf));
+        assert_eq!(collect_ids(&head), vec![1]);
+    }
+
+    #[test]
+    fn relink_goes_to_tail() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.unlink(&a);
+            guard.link(&a); // goes to tail
+        }
+        assert_eq!(collect_ids(&head), vec![2, 1]);
+    }
+
+    #[test]
+    fn head_retains_self_link_after_last_leaf_unlinked() {
+        // Once the head's circular sentinel is initialised by the first link,
+        // it persists even after all leaves are removed. Only unlink(head)
+        // clears it. This is by design — the sentinel is lazily initialised
+        // and never eagerly torn down.
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        let guard = head.lock_head();
+        guard.link(&leaf);
+        guard.unlink(&leaf);
+        assert!(unsafe { head.is_linked() });
+    }
+
+    #[test]
+    fn unlink_head_clears_self_link() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        let guard = head.lock_head();
+        guard.link(&leaf);
+        guard.unlink(&head);
+        assert!(!unsafe { head.is_linked() });
+    }
+
+    // ── Filter operations ─────────────────────────────────────────────────
+
+    #[test]
+    fn filter_empty_list_does_not_call_closure() {
+        let head = make_head(0);
+        let guard = head.lock_head();
+        let mut called = false;
+        guard.filter(|_| {
+            called = true;
+            true
+        });
+        assert!(!called);
+    }
+
+    #[test]
+    fn filter_empty_self_linked_head_does_not_call_closure() {
+        // Head was once linked (self-link persists) but has no leaves.
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&leaf);
+            guard.unlink(&leaf);
+        }
+        let guard = head.lock_head();
+        let mut called = false;
+        guard.filter(|_| {
+            called = true;
+            true
+        });
+        assert!(!called);
+    }
+
+    #[test]
+    fn filter_keep_all() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.filter(|_| true);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn filter_remove_all() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.filter(|_| false);
+        }
+        assert!(!node_is_linked(&head, &a));
+        assert!(!node_is_linked(&head, &b));
+        assert!(!node_is_linked(&head, &c));
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn filter_selective_keep_even() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        let d = make_leaf(&head, 4);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.link(&d);
+            guard.filter(|v| v.id() % 2 == 0);
+        }
+        assert_eq!(collect_ids(&head), vec![2, 4]);
+    }
+
+    #[test]
+    fn filter_removes_first_node() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.filter(|v| v.id() != 1);
+        }
+        assert_eq!(collect_ids(&head), vec![2, 3]);
+    }
+
+    #[test]
+    fn filter_removes_last_node() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.filter(|v| v.id() != 3);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 2]);
+    }
+
+    #[test]
+    fn filter_single_node_keep() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.filter(|_| true);
+        }
+        assert_eq!(collect_ids(&head), vec![1]);
+    }
+
+    #[test]
+    fn filter_single_node_remove() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.filter(|_| false);
+        }
+        assert!(!node_is_linked(&head, &a));
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn filter_visits_nodes_in_insertion_order() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 10);
+        let b = make_leaf(&head, 20);
+        let c = make_leaf(&head, 30);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+        }
+        let guard = head.lock_head();
+        let mut visited = Vec::new();
+        guard.filter(|v| {
+            visited.push(v.id());
+            true
+        });
+        assert_eq!(visited, vec![10, 20, 30]);
+    }
+
+    // ── Drop behavior ─────────────────────────────────────────────────────
+
+    #[test]
+    fn drop_linked_leaf_unlinks_itself() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+        }
+        drop(b);
+        assert_eq!(collect_ids(&head), vec![1, 3]);
+    }
+
+    #[test]
+    fn drop_unlinked_leaf_is_safe() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        drop(leaf);
+        // No panic, no crash.
+    }
+
+    #[test]
+    fn drop_head_with_no_leaves() {
+        // Head was never linked — dropping is trivially safe.
+        let _head = make_head(0);
+    }
+
+    #[test]
+    fn drop_head_after_all_leaves_dropped() {
+        // Do not call drop(head) explicitly — that moves the node, breaking
+        // self-referential pointers.  Let it drop naturally at end of scope.
+        let head = make_head(0);
+        {
+            let a = make_leaf(&head, 1);
+            let b = make_leaf(&head, 2);
+            {
+                let guard = head.lock_head();
+                guard.link(&a);
+                guard.link(&b);
+            }
+            // a and b are dropped here (reverse order: b, then a).
+        }
+        assert_eq!(collect_ids(&head), vec![]);
+        // head drops here in place — safe because all leaves are gone.
+    }
+
+    // ── Panics ────────────────────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "node does not target this list's head")]
+    fn link_wrong_head_panics() {
+        let head1 = make_head(0);
+        let head2 = make_head(0);
+        let leaf = make_leaf(&head1, 1);
+        let guard = head2.lock_head();
+        guard.link(&leaf);
+    }
+
+    #[test]
+    #[should_panic(expected = "node does not target this list's head")]
+    fn unlink_leaf_from_wrong_head_panics() {
+        let head1 = make_head(0);
+        let head2 = make_head(0);
+        let leaf = make_leaf(&head1, 1);
+        {
+            let guard = head1.lock_head();
+            guard.link(&leaf);
+        }
+        let guard = head2.lock_head();
+        guard.unlink(&leaf);
+    }
+
+    // ── Combined operations ───────────────────────────────────────────────
+
+    #[test]
+    fn link_unlink_relink_multiple_cycles() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        for _ in 0..10 {
+            {
+                let guard = head.lock_head();
+                guard.link(&leaf);
+            }
+            assert!(node_is_linked(&head, &leaf));
+            {
+                let guard = head.lock_head();
+                guard.unlink(&leaf);
+            }
+            assert!(!node_is_linked(&head, &leaf));
+        }
+    }
+
+    #[test]
+    fn filter_then_relink_removed_nodes() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+            guard.filter(|v| v.id() != 2);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 3]);
+        {
+            let guard = head.lock_head();
+            guard.link(&b); // goes to tail
+        }
+        assert_eq!(collect_ids(&head), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn unlink_all_leaves_individually_in_mixed_order() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        let c = make_leaf(&head, 3);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.link(&c);
+        }
+        {
+            let guard = head.lock_head();
+            guard.unlink(&b); // middle
+        }
+        assert_eq!(collect_ids(&head), vec![1, 3]);
+        {
+            let guard = head.lock_head();
+            guard.unlink(&c); // tail
+        }
+        assert_eq!(collect_ids(&head), vec![1]);
+        {
+            let guard = head.lock_head();
+            guard.unlink(&a); // last remaining
+        }
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+
+    #[test]
+    fn unlink_head_then_relink_leaves() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.unlink(&head); // tear down
+        }
+        assert_eq!(collect_ids(&head), vec![]);
+        {
+            let guard = head.lock_head();
+            guard.link(&b);
+            guard.link(&a);
+        }
+        assert_eq!(collect_ids(&head), vec![2, 1]);
+    }
+
+    #[test]
+    fn many_nodes_link_and_filter() {
+        let head = make_head(0);
+        let leaves: Vec<_> = (0..10).map(|i| make_leaf(&head, i)).collect();
+        {
+            let guard = head.lock_head();
+            for leaf in &leaves {
+                guard.link(leaf);
+            }
+        }
+        assert_eq!(collect_ids(&head), (0..10).collect::<Vec<_>>());
+        {
+            let guard = head.lock_head();
+            guard.filter(|v| v.id() % 2 == 0);
+        }
+        assert_eq!(collect_ids(&head), vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn filter_alternating_keep_remove() {
+        let head = make_head(0);
+        let leaves: Vec<_> = (0..6).map(|i| make_leaf(&head, i)).collect();
+        {
+            let guard = head.lock_head();
+            for leaf in &leaves {
+                guard.link(leaf);
+            }
+            // Remove 0, keep 1, remove 2, keep 3, remove 4, keep 5.
+            guard.filter(|v| v.id() % 2 == 1);
+        }
+        assert_eq!(collect_ids(&head), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn filter_counts_removed_nodes() {
+        let head = make_head(0);
+        let leaves: Vec<_> = (1..=5).map(|i| make_leaf(&head, i)).collect();
+        {
+            let guard = head.lock_head();
+            for leaf in &leaves {
+                guard.link(leaf);
+            }
+        }
+        let guard = head.lock_head();
+        let mut removed = 0;
+        guard.filter(|v| {
+            if v.id() > 3 {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        assert_eq!(removed, 2);
+        drop(guard);
+        assert_eq!(collect_ids(&head), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn guard_deref_mut_from_leaf_lock() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let mut guard = leaf.lock_head();
+            *guard = 77;
+        }
+        let guard = head.lock_head();
+        assert_eq!(*guard, 77);
+    }
+
+    #[test]
+    fn double_unlink_same_leaf_is_noop() {
+        let head = make_head(0);
+        let a = make_leaf(&head, 1);
+        let b = make_leaf(&head, 2);
+        {
+            let guard = head.lock_head();
+            guard.link(&a);
+            guard.link(&b);
+            guard.unlink(&a);
+            guard.unlink(&a); // already unlinked — no-op
+        }
+        assert_eq!(collect_ids(&head), vec![2]);
+    }
+
+    #[test]
+    fn unlink_head_twice_is_safe() {
+        let head = make_head(0);
+        let leaf = make_leaf(&head, 1);
+        {
+            let guard = head.lock_head();
+            guard.link(&leaf);
+            guard.unlink(&head);
+            guard.unlink(&head); // already cleared — no-op
+        }
+        assert_eq!(collect_ids(&head), vec![]);
+    }
+}

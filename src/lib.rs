@@ -7,7 +7,6 @@ pub mod proc_machines;
 pub mod watchable_value;
 
 pub use alarm_clock::*;
-pub use intrusive_list::*;
 pub use io_exchange::*;
 pub use io_sink::*;
 pub use io_stream::*;

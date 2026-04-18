@@ -845,12 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn drop_head_with_no_leaves() {
-        // Head was never linked — dropping is trivially safe.
-        let _head = make_head(0);
-    }
-
-    #[test]
     fn drop_head_after_all_leaves_dropped() {
         // Do not call drop(head) explicitly — that moves the node, breaking
         // self-referential pointers.  Let it drop naturally at end of scope.

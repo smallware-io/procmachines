@@ -1,0 +1,27 @@
+[package]
+name = "procmachines"
+version = "0.1.0"
+edition = "2024"
+description = "State machines in the procedural style"
+license = "MIT"
+keywords = []
+categories = ["network-programming", "development-tools"]
+repository = "https://github.com/smallware-io/procmachines"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[lib]
+name = "procmachines"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+futures = { version = "0.3", features = ["bilock", "unstable"] }
+futures-util = "0.3"
+bytes = "1.5"
+flume = "0.11"
+bytemuck = {version ="1.25.0", features = ["derive", "extern_crate_alloc"]}
+parking_lot = "0.12.5"

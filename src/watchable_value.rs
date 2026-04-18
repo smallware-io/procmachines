@@ -45,9 +45,10 @@ use std::{
 /// [`ValueWatch`].
 ///
 /// Head nodes hold a `Mutex<T>` protecting the current value.  Leaf nodes
-/// store a `ready` flag, a [`Waker`], and a raw pointer back to the head node.
-/// When the value changes, all linked leaves have their `ready` flag set to
-/// `true` and are woken.
+/// store a [`Waker`] and a raw pointer back to the head node.  When the
+/// value changes, all linked leaves are unlinked and woken.  Readiness is
+/// determined by link state: an unlinked leaf is ready, a linked leaf is
+/// pending.
 enum WatchNodeValue<T: Clone> {
     Head {
         mutex: Mutex<T>,
@@ -72,8 +73,7 @@ impl<T: Clone> WatchNodeValue<T> {
         }
     }
 
-    /// Sets the leaf's ready flag to `true` and takes and wakes the stored
-    /// waker (if any).
+    /// Takes and wakes the stored waker (if any).
     ///
     /// No-op on head nodes.
     ///
@@ -136,8 +136,8 @@ impl<T: Clone> IntrusiveNodeValue for WatchNodeValue<T> {
 
 /// A shared value that can wake [`ValueWatch`] futures when it changes.
 ///
-/// The value and a generation counter are protected by a mutex.  When the
-/// value is updated via [`set`](Self::set), all linked watchers are woken.
+/// The value is protected by a mutex.  When the value is updated via
+/// [`set`](Self::set), all linked watchers are unlinked and woken.
 ///
 /// # Pinning
 ///

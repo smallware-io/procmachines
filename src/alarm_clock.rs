@@ -180,7 +180,7 @@ impl<T: PartialOrd + Clone> IntrusiveNodeValue for ClockNodeValue<T> {
 ///
 /// ```rust,ignore
 /// use std::pin::pin;
-/// use smallware_tunnel::alarms::{AlarmClock, ClockAlarm};
+/// use procmachines::{AlarmClock, ClockAlarm};
 ///
 /// let clock = pin!(AlarmClock::new(0u64));
 /// let alarm = pin!(ClockAlarm::new(clock.as_ref(), Some(10)));
@@ -224,14 +224,7 @@ impl<T: PartialOrd + Clone> AlarmClock<T> {
         }
     }
 
-    /// Returns a reference to the current clock value.
-    ///
-    /// # Note
-    ///
-    /// The returned reference is synchronized via an internal lock acquire, but
-    /// the lock is not held for the lifetime of the reference.  This is safe when
-    /// the clock is only mutated from a single task (the typical usage pattern).
-    // TODO more safety
+    /// Returns a clone of the current clock value.
     #[inline(always)]
     pub fn get(&self) -> T {
         let guard = self.head.lock_head();

@@ -19,7 +19,7 @@
 //!   task closures themselves need.
 //! - **Deterministic scheduling.** All tasks run under one mutex, so there
 //!   are no data races and the polling order is fully controlled.
-//! - **External clock.** Timeouts use an [`AlarmClock`](crate::alarms::AlarmClock)
+//! - **External clock.** Timeouts use an [`AlarmClock`](crate::alarm_clock::AlarmClock)
 //!   advanced by the caller, making the protocol testable without real time.
 //!
 //! # Architecture
@@ -95,7 +95,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// advance automatically when the lock is released.
 ///
 /// Implemented by [`ProcMachineImpl`]; callers work with
-/// `Arc<dyn ProcMachine<IO>>` (type-aliased as e.g. `TunnelProtocol`).
+/// `Arc<dyn ProcMachine<IO>>`.
 pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     /// Returns `true` when every internal task has completed.
     ///
@@ -240,7 +240,7 @@ where
 /// Marker type returned by async tasks when they complete.
 ///
 /// The actual result of a task is communicated via side effects on the
-/// shared IO struct (e.g. setting a field in [`UpToDown`](crate::tunnel_protocol::UpToDown)).
+/// shared IO struct.
 pub struct TaskEnd();
 
 /// Trait for the compile-time linked list of futures inside a ProcMachine.

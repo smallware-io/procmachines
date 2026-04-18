@@ -1,9 +1,7 @@
 //! Single-slot rendezvous channel implementing both [`IoSink`] and [`IoStream`].
 //!
 //! [`IoExchange`] transfers at most one item at a time between a writer
-//! (the [`IoSink`] side) and a reader (the [`IoStream`] side). It is the
-//! concrete implementation backing the tunnel protocol's data-flow pipes
-//! (`down_in`, `down_out`, `up_in`, `up_out`).
+//! (the [`IoSink`] side) and a reader (the [`IoStream`] side).
 //!
 //! # State machine
 //!
@@ -57,9 +55,10 @@ use crate::{io_sink::IoSink, io_stream::IoStream};
 ///
 /// # Usage
 ///
-/// The tunnel protocol creates four `IoExchange` instances per connection:
-/// two for the downstream (WebSocket ↔ protocol logic) direction and two
-/// for the upstream (protocol logic ↔ application) direction.
+/// Embed `IoExchange` fields in the IO struct shared between a
+/// `ProcMachine`'s internal tasks and external code. Tasks use the
+/// [`IoSink`] / [`IoStream`] methods to send and receive items, while
+/// external code interacts through the [`IoGuard`](crate::IoGuard).
 #[derive(Debug)]
 pub struct IoExchange<ITEM> {
     /// Waker for the reader side, notified when an item is placed or the

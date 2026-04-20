@@ -19,15 +19,15 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU8, Ordering},
         Mutex,
+        atomic::{AtomicU8, Ordering},
     },
     task::{Context, Poll},
 };
 
+use crate::io_exchange::ExchangeWriteError;
 use bytes::Bytes;
 use futures::task::AtomicWaker;
-use crate::io_exchange::ExchangeWriteError;
 
 use crate::{io_reader::IoReader, io_writer::IoWriter};
 
@@ -121,7 +121,11 @@ impl IoBytesExchange {
 // ---------------------------------------------------------------------------
 
 impl IoReader for IoBytesExchange {
-    fn con_poll_read(&self, cx: &mut Context<'_>, max_len: usize) -> Poll<std::io::Result<Option<Bytes>>> {
+    fn con_poll_read(
+        &self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<std::io::Result<Option<Bytes>>> {
         // Hold the data lock so state and payload stay in sync with the
         // writer during transitions that touch both.
         let mut guard = self.data.lock().unwrap();
@@ -143,12 +147,7 @@ impl IoReader for IoBytesExchange {
                 self.reader.register(cx.waker());
                 if self
                     .state
-                    .compare_exchange(
-                        st,
-                        EXCH_EMPTY_FLUSHED,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
+                    .compare_exchange(st, EXCH_EMPTY_FLUSHED, Ordering::SeqCst, Ordering::SeqCst)
                     .is_err()
                 {
                     // Writer raced us (e.g. prod_poll_close); re-poll to
@@ -164,8 +163,9 @@ impl IoReader for IoBytesExchange {
             EXCH_FULL_CLOSED => EXCH_DONE,
             // Terminal (DONE or DROPPED) — end-of-stream, repeatable.
             _ => {
-                // con_poll* contract: pre-wake on every Ready.  The caller
-                // is responsible for recognising EOS and breaking its loop.
+                // con_poll* contract: each EOS return counts as consuming
+                // one repetition of the signal, so pre-wake the caller.
+                // The caller must recognise EOS and break its loop.
                 cx.waker().wake_by_ref();
                 return Poll::Ready(Ok(None));
             }
@@ -177,7 +177,9 @@ impl IoReader for IoBytesExchange {
             // Defensive: state claimed FULL but slot is empty.  Transition
             // to nextst and self-wake so the caller re-polls into the
             // correct branch.
-            let _ = self.state.compare_exchange(st, nextst, Ordering::SeqCst, Ordering::SeqCst);
+            let _ = self
+                .state
+                .compare_exchange(st, nextst, Ordering::SeqCst, Ordering::SeqCst);
             self.writer.wake();
             cx.waker().wake_by_ref();
             return Poll::Pending;
@@ -185,7 +187,8 @@ impl IoReader for IoBytesExchange {
 
         if max_len == 0 {
             // The caller only wants to check liveness, not consume data.
-            // Return an empty Bytes to signal "stream is alive".
+            // Return an empty Bytes to signal "stream is alive".  Per the
+            // con_poll* contract this non-consuming Ready does not pre-wake.
             return Poll::Ready(Ok(Some(Bytes::new())));
         }
 
@@ -205,7 +208,8 @@ impl IoReader for IoBytesExchange {
         self.writer.wake();
         drop(guard);
 
-        // con_poll* contract: pre-wake on every Ready.
+        // con_poll* contract: bytes were actually consumed, so pre-wake
+        // the caller to keep it scheduled to drain more.
         cx.waker().wake_by_ref();
         Poll::Ready(Ok(Some(data)))
     }
@@ -469,8 +473,10 @@ mod tests {
     #[test]
     fn write_then_read() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"hello");
         let n = match IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload) {
@@ -495,7 +501,8 @@ mod tests {
     #[test]
     fn write_empty_bytes_is_noop() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let mut empty = Bytes::new();
         match IoWriter::prod_poll_write(&ex, &mut wcx, &mut empty) {
@@ -509,7 +516,8 @@ mod tests {
     #[test]
     fn read_zero_on_empty_returns_pending() {
         let ex = IoBytesExchange::new();
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // max_len=0 on an empty exchange should return Pending (no data,
         // and we can't say the stream is in error).
@@ -522,12 +530,15 @@ mod tests {
     #[test]
     fn read_zero_on_full_returns_some_empty() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (rw, rwaker) = make_waker();
+        let mut rcx = Context::from_waker(&rwaker);
 
         let mut payload = Bytes::from_static(b"data");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
 
+        rw.reset();
         // max_len=0 on a full exchange: "stream is alive" → Some(empty).
         match IoReader::con_poll_read(&ex, &mut rcx, 0) {
             Poll::Ready(Ok(Some(data))) => assert!(data.is_empty()),
@@ -535,6 +546,9 @@ mod tests {
         }
         // Data should still be in the slot (not consumed).
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        // con_poll* contract: a non-consuming Ready (max_len == 0 probe on
+        // a live stream) must not pre-wake the caller.
+        assert_eq!(rw.count(), 0, "max_len=0 probe must not pre-wake");
     }
 
     // -----------------------------------------------------------------------
@@ -544,8 +558,10 @@ mod tests {
     #[test]
     fn partial_read_splits_data() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (rw, rwaker) = make_waker(); let mut rcx = Context::from_waker(&rwaker);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (rw, rwaker) = make_waker();
+        let mut rcx = Context::from_waker(&rwaker);
 
         let mut payload = Bytes::from_static(b"abcdef");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
@@ -559,7 +575,10 @@ mod tests {
         // State should still be FULL (remainder in slot).
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
         // Reader should have been pre-emptively woken (more data available).
-        assert!(rw.count() > 0, "reader waker should fire after partial read");
+        assert!(
+            rw.count() > 0,
+            "reader waker should fire after partial read"
+        );
 
         // Read the rest.
         match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
@@ -576,7 +595,8 @@ mod tests {
     #[test]
     fn write_when_full_returns_pending() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let mut a = Bytes::from_static(b"first");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut a);
@@ -596,7 +616,8 @@ mod tests {
     #[test]
     fn read_on_empty_returns_pending() {
         let ex = IoBytesExchange::new();
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
             Poll::Pending => {}
@@ -611,8 +632,10 @@ mod tests {
     #[test]
     fn writer_is_woken_after_read_frees_slot() {
         let ex = IoBytesExchange::new();
-        let (ww, wwaker) = make_waker(); let mut wcx = Context::from_waker(&wwaker);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (ww, wwaker) = make_waker();
+        let mut wcx = Context::from_waker(&wwaker);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"x");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
@@ -634,8 +657,10 @@ mod tests {
     #[test]
     fn reader_is_woken_after_write_fills_slot() {
         let ex = IoBytesExchange::new();
-        let (rw, rwaker) = make_waker(); let mut rcx = Context::from_waker(&rwaker);
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (rw, rwaker) = make_waker();
+        let mut rcx = Context::from_waker(&rwaker);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         // Reader tries to read an empty slot.
         rw.reset();
@@ -658,8 +683,10 @@ mod tests {
     #[test]
     fn flush_on_empty_completes_after_reader_ack() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Flush on an empty slot: writer requests flush.
         match IoWriter::prod_poll_flush(&ex, &mut wcx) {
@@ -685,8 +712,10 @@ mod tests {
     #[test]
     fn flush_on_full_completes_after_read_and_ack() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Write data, then flush.
         let mut payload = Bytes::from_static(b"flush-me");
@@ -721,8 +750,10 @@ mod tests {
     #[test]
     fn flush_already_flushed_returns_ready() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Get to EMPTY_FLUSHED via the normal path.
         let _ = IoWriter::prod_poll_flush(&ex, &mut wcx); // EMPTY → EMPTY_FLUSH
@@ -742,8 +773,10 @@ mod tests {
     #[test]
     fn close_on_empty_goes_to_done() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         match IoWriter::prod_poll_close(&ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
@@ -761,8 +794,10 @@ mod tests {
     #[test]
     fn close_on_full_delivers_last_item_then_eof() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Write data then close.
         let mut payload = Bytes::from_static(b"last");
@@ -790,7 +825,8 @@ mod tests {
     #[test]
     fn close_is_idempotent() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
@@ -809,7 +845,8 @@ mod tests {
     #[test]
     fn drop_read_signals_writer() {
         let ex = IoBytesExchange::new();
-        let (ww, wwaker) = make_waker(); let mut wcx = Context::from_waker(&wwaker);
+        let (ww, wwaker) = make_waker();
+        let mut wcx = Context::from_waker(&wwaker);
 
         // Fill the slot so a second write has to block (Pending path
         // registers the writer's waker, per the prod_poll* contract).
@@ -840,7 +877,8 @@ mod tests {
     #[test]
     fn drop_read_on_empty() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         IoReader::drop_read(&ex);
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
@@ -863,7 +901,8 @@ mod tests {
     #[test]
     fn drop_read_after_done_is_noop() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
 
@@ -879,8 +918,10 @@ mod tests {
     #[test]
     fn read_after_done_returns_none() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
 
@@ -895,7 +936,8 @@ mod tests {
     #[test]
     fn read_after_dropped_returns_none() {
         let ex = IoBytesExchange::new();
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         IoReader::drop_read(&ex);
 
@@ -912,7 +954,8 @@ mod tests {
     #[test]
     fn write_after_done_returns_error() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
 
@@ -930,7 +973,8 @@ mod tests {
     #[test]
     fn flush_after_done_returns_ok() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
 
@@ -943,7 +987,8 @@ mod tests {
     #[test]
     fn flush_after_dropped_returns_ok() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         IoReader::drop_read(&ex);
 
@@ -956,7 +1001,8 @@ mod tests {
     #[test]
     fn close_after_dropped_returns_ok() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         IoReader::drop_read(&ex);
 
@@ -973,8 +1019,10 @@ mod tests {
     #[test]
     fn close_on_full_flush_transitions_to_full_closed() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Write + flush → FULL_FLUSH.
         let mut payload = Bytes::from_static(b"data");
@@ -1004,8 +1052,10 @@ mod tests {
     #[test]
     fn multiple_write_read_cycles() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         for i in 0u32..10 {
             let msg = format!("msg-{}", i);
@@ -1029,8 +1079,10 @@ mod tests {
     #[test]
     fn partial_reads_drain_slot_correctly() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"0123456789");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
@@ -1063,8 +1115,10 @@ mod tests {
     #[test]
     fn partial_read_with_close_defers_done() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"abcd");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
@@ -1099,8 +1153,10 @@ mod tests {
     #[test]
     fn eof_with_max_len_gt_zero_wakes_reader() {
         let ex = IoBytesExchange::new();
-        let (rw, rwaker) = make_waker(); let mut rcx = Context::from_waker(&rwaker);
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (rw, rwaker) = make_waker();
+        let mut rcx = Context::from_waker(&rwaker);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
 
@@ -1111,14 +1167,19 @@ mod tests {
         }
         // The reader should pre-emptively wake itself for consumption
         // requests on terminal states.
-        assert!(rw.count() > 0, "reader should self-wake on EOF consumption request");
+        assert!(
+            rw.count() > 0,
+            "reader should self-wake on EOF consumption request"
+        );
     }
 
     #[test]
     fn eof_with_max_len_zero_pre_wakes_reader() {
         let ex = IoBytesExchange::new();
-        let (rw, rwaker) = make_waker(); let mut rcx = Context::from_waker(&rwaker);
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (rw, rwaker) = make_waker();
+        let mut rcx = Context::from_waker(&rwaker);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
 
@@ -1127,10 +1188,13 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
-        // con_poll* contract: every Ready return pre-wakes, including a
-        // repeatable EOS with max_len == 0.  The caller is responsible for
-        // recognising the signal and breaking out of its loop.
-        assert!(rw.count() > 0, "reader should self-wake on EOF regardless of max_len");
+        // con_poll* contract: each EOS return counts as consumption, so
+        // it pre-wakes even with max_len == 0.  The caller is responsible
+        // for recognising the signal and breaking out of its loop.
+        assert!(
+            rw.count() > 0,
+            "reader should self-wake on EOF regardless of max_len"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1140,7 +1204,8 @@ mod tests {
     #[test]
     fn close_on_empty_flush_goes_to_done() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         // Get to EMPTY_FLUSH.
         let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
@@ -1157,8 +1222,10 @@ mod tests {
     #[test]
     fn close_on_empty_flushed_goes_to_done() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
-        let (_, rw) = make_waker(); let mut rcx = Context::from_waker(&rw);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
+        let (_, rw) = make_waker();
+        let mut rcx = Context::from_waker(&rw);
 
         // Get to EMPTY_FLUSHED.
         let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
@@ -1179,7 +1246,8 @@ mod tests {
     #[test]
     fn drop_read_during_flush() {
         let ex = IoBytesExchange::new();
-        let (_, ww) = make_waker(); let mut wcx = Context::from_waker(&ww);
+        let (_, ww) = make_waker();
+        let mut wcx = Context::from_waker(&ww);
 
         let mut payload = Bytes::from_static(b"data");
         let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
@@ -1208,15 +1276,17 @@ mod tests {
         let writer = tokio::spawn(async move {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"async-hello");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
@@ -1224,18 +1294,14 @@ mod tests {
 
         let reader_ex = ex.clone();
         let reader = tokio::spawn(async move {
-            let data = std::future::poll_fn(|cx| {
-                IoReader::con_poll_read(&*reader_ex, cx, 1024)
-            })
-            .await
-            .unwrap();
+            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                .await
+                .unwrap();
             assert_eq!(data.unwrap(), Bytes::from_static(b"async-hello"));
 
-            let eof = std::future::poll_fn(|cx| {
-                IoReader::con_poll_read(&*reader_ex, cx, 1024)
-            })
-            .await
-            .unwrap();
+            let eof = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                .await
+                .unwrap();
             assert!(eof.is_none(), "expected EOF");
         });
 
@@ -1253,15 +1319,17 @@ mod tests {
             for chunk in &chunks {
                 std::future::poll_fn(|cx| {
                     let mut data = Bytes::from_static(chunk);
-                    IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
-                        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                    IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
+                        r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    })
                 })
                 .await
                 .unwrap();
             }
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
@@ -1271,11 +1339,10 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut received = Vec::new();
             loop {
-                let result = std::future::poll_fn(|cx| {
-                    IoReader::con_poll_read(&*reader_ex, cx, 1024)
-                })
-                .await
-                .unwrap();
+                let result =
+                    std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                        .await
+                        .unwrap();
                 match result {
                     Some(data) => received.push(data),
                     None => break,
@@ -1298,16 +1365,18 @@ mod tests {
             // Send data.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"flush-test");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
 
             // Flush — blocks until reader acks.
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_flush(&*writer_ex, cx)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_flush(&*writer_ex, cx).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
@@ -1315,15 +1384,17 @@ mod tests {
             // Send more after flush.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"post-flush");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
-                    .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))
+                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                })
             })
             .await
             .unwrap();
@@ -1332,29 +1403,23 @@ mod tests {
         let reader_ex = ex.clone();
         let reader = tokio::spawn(async move {
             // Read first chunk.
-            let data = std::future::poll_fn(|cx| {
-                IoReader::con_poll_read(&*reader_ex, cx, 1024)
-            })
-            .await
-            .unwrap()
-            .unwrap();
+            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(&data[..], b"flush-test");
 
             // Read second chunk (written after flush completed).
-            let data = std::future::poll_fn(|cx| {
-                IoReader::con_poll_read(&*reader_ex, cx, 1024)
-            })
-            .await
-            .unwrap()
-            .unwrap();
+            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(&data[..], b"post-flush");
 
             // EOF.
-            let eof = std::future::poll_fn(|cx| {
-                IoReader::con_poll_read(&*reader_ex, cx, 1024)
-            })
-            .await
-            .unwrap();
+            let eof = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
+                .await
+                .unwrap();
             assert!(eof.is_none());
         });
 

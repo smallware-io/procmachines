@@ -198,7 +198,9 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
             EXCH_FULL => EXCH_EMPTY,
             EXCH_FULL_FLUSH => EXCH_EMPTY_FLUSH,
             EXCH_FULL_CLOSED => EXCH_DONE,
-            // DONE or DROPPED — end-of-stream (repeatable).
+            // DONE or DROPPED — end-of-stream (repeatable).  Each return
+            // counts as consuming one repetition of the EOS signal, so
+            // pre-wake per the con_poll* contract.
             _ => {
                 cx.waker().wake_by_ref();
                 return Poll::Ready(None);
@@ -219,7 +221,8 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
         self.writer.wake();
         drop(guard);
 
-        // No matter what, we need to pre-wake
+        // An item (or the final EOS if nextst == DONE) was consumed, so
+        // pre-wake the caller per the con_poll* contract.
         cx.waker().wake_by_ref();
 
         if let Some(item) = item {
@@ -582,5 +585,104 @@ mod tests {
             ready,
             Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
         ));
+    }
+
+    // A minimal `Waker` that records how many times it was woken.
+    struct CountWaker(std::sync::atomic::AtomicUsize);
+    impl CountWaker {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self(std::sync::atomic::AtomicUsize::new(0)))
+        }
+        fn count(&self) -> usize {
+            self.0.load(AtomicOrdering::SeqCst)
+        }
+        fn reset(&self) {
+            self.0.store(0, AtomicOrdering::SeqCst);
+        }
+    }
+    impl std::task::Wake for CountWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn con_check_read_does_not_pre_wake() {
+        // con_poll* contract: con_check_read is a state-only probe and
+        // must never pre-wake on Ready, regardless of the returned bool.
+        let r: IoExchange<i32> = IoExchange::new();
+        let cw = CountWaker::new();
+        let w: std::task::Waker = cw.clone().into();
+        let mut cx = Context::from_waker(&w);
+
+        // Ready(true) on FULL.
+        match r.prod_poll_send(&mut cx, &mut Some(1)) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("expected send Ok, got {:?}", other),
+        }
+        cw.reset();
+        match r.con_check_read(&mut cx) {
+            Poll::Ready(true) => {}
+            other => panic!("expected Ready(true), got {:?}", other),
+        }
+        assert_eq!(
+            cw.count(),
+            0,
+            "con_check_read Ready(true) must not pre-wake"
+        );
+
+        // Consume the item to clear the slot.
+        let _ = r.con_poll_read(&mut cx);
+
+        // Ready(false) on DONE.
+        match r.prod_poll_close(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("expected close Ok, got {:?}", other),
+        }
+        cw.reset();
+        match r.con_check_read(&mut cx) {
+            Poll::Ready(false) => {}
+            other => panic!("expected Ready(false), got {:?}", other),
+        }
+        assert_eq!(
+            cw.count(),
+            0,
+            "con_check_read Ready(false) must not pre-wake"
+        );
+    }
+
+    #[test]
+    fn con_poll_read_pre_wakes_on_consume_and_eof() {
+        // Pre-wake when an item is consumed, and again when EOS is
+        // consumed (each EOS return counts as consumption).
+        let r = IoExchange::new();
+        let cw = CountWaker::new();
+        let w: std::task::Waker = cw.clone().into();
+        let mut cx = Context::from_waker(&w);
+
+        match r.prod_poll_send(&mut cx, &mut Some(99)) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("expected send Ok, got {:?}", other),
+        }
+        cw.reset();
+        match r.con_poll_read(&mut cx) {
+            Poll::Ready(Some(99)) => {}
+            other => panic!("expected Ready(Some(99)), got {:?}", other),
+        }
+        assert!(cw.count() > 0, "consuming an item must pre-wake");
+
+        match r.prod_poll_close(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            other => panic!("expected close Ok, got {:?}", other),
+        }
+        cw.reset();
+        match r.con_poll_read(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("expected Ready(None), got {:?}", other),
+        }
+        assert!(cw.count() > 0, "consuming EOS must pre-wake");
     }
 }

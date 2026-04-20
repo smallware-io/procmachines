@@ -34,7 +34,7 @@ use std::task::{Context, Poll};
 /// The `prod_poll*` methods on this trait are intended for use by a single
 /// "producer" — a task that is producing items (or progress toward delivery)
 /// to be consumed downstream.  Each `prod_poll*` method behaves like
-/// [`Future::poll`](std::future::Future::poll):
+/// [`Future::poll`]:
 ///
 /// - If it returns [`Poll::Pending`], the calling task is registered to be
 ///   woken later when the same call might return [`Poll::Ready`].

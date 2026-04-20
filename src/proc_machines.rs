@@ -43,9 +43,9 @@
 //! 1. External code calls [`LockableIo::lock`] to obtain an [`IoGuard`].
 //! 2. Through the guard it reads/writes the IO struct (e.g. feeding data
 //!    into an [`IoExchange`](crate::io_exchange::IoExchange)).
-//! 3. When the guard is dropped, [`ProcMachineImpl::unsafe_unlock_io`] calls
-//!    [`tick`](ProcMachineInner::tick), which polls every task whose waker
-//!    has fired since the last tick.
+//! 3. When the guard is dropped, the machine's internal unlock path runs a
+//!    `tick`, which polls every task whose waker has fired since the last
+//!    tick.
 //! 4. Tasks run until they all return `Pending`, then control returns to the
 //!    caller.
 //!
@@ -54,8 +54,8 @@
 //! Each task gets its own [`Waker`] via the [multi-waker system](#multi-waker-support).
 //! When a task registers a waker with an IO primitive (e.g. `IoExchange`)
 //! and that primitive later calls `wake()`, the corresponding bit is set in
-//! the shared `wake_mask: AtomicU32`. The next [`tick`](ProcMachineInner::tick)
-//! intersects `wake_mask` with `alive_mask` to determine which tasks to poll.
+//! the shared `wake_mask: AtomicU32`. The next `tick` intersects `wake_mask`
+//! with `alive_mask` to determine which tasks to poll.
 //!
 //! # Building a ProcMachine
 //!
@@ -94,8 +94,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// [`LockableIo::lock`]) and reading/writing its fields. Internal tasks
 /// advance automatically when the lock is released.
 ///
-/// Implemented by [`ProcMachineImpl`]; callers work with
-/// `Arc<dyn ProcMachine<IO>>`.
+/// Callers work with `Arc<dyn ProcMachine<IO>>`.
 pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     /// Returns `true` when every internal task has completed.
     ///
@@ -123,8 +122,8 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     ///
     /// # Safety
     ///
-    /// - `&self` must be pinned by an `Arc` (guaranteed by the
-    ///   [`ProcMachineImpl`] constructor).
+    /// - `&self` must be pinned by an `Arc` (guaranteed by the machine's
+    ///   constructor).
     /// - The caller **must** call [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)
     ///   exactly once after the critical section, and must not use the
     ///   returned pointer after that call.
@@ -256,7 +255,7 @@ pub trait ProcMachineFutures {
     ///
     /// Returns a bitmask with a bit set for every task that is still alive
     /// (i.e. has a future and has not yet returned `Ready`).
-    fn poll<T: MultiWake + 'static>(self: &mut Self, waker: &Arc<T>, depth_mask: u32) -> u32;
+    fn poll<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, depth_mask: u32) -> u32;
 
     /// Creates an uninitialised instance (futures are `None`).
     fn new() -> Self;
@@ -269,7 +268,7 @@ impl ProcMachineFutures for ProcMachineFuturesBase {
     const DEPTH: u8 = 0;
 
     #[inline(always)]
-    fn poll<T: MultiWake + 'static>(self: &mut Self, _waker: &Arc<T>, _depth_mask: u32) -> u32 {
+    fn poll<T: MultiWake + 'static>(&mut self, _waker: &Arc<T>, _depth_mask: u32) -> u32 {
         0 // no tasks → nothing alive
     }
 
@@ -305,7 +304,7 @@ impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMach
     }
 
     #[inline(always)]
-    fn poll<T: MultiWake + 'static>(self: &mut Self, waker: &Arc<T>, depth_mask: u32) -> u32 {
+    fn poll<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, depth_mask: u32) -> u32 {
         // Poll all tasks in the chain before this one.
         let parent_result = self.prev.poll(waker, depth_mask);
 
@@ -379,7 +378,7 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
 
     /// Appends a new task and returns an extended builder.
     fn with<FUT: Future<Output = TaskEnd> + 'static>(
-        self: Self,
+        self,
         proc: fn(Pin<&'static IO>) -> FUT,
     ) -> impl ProcMachineJobs<IO>;
 
@@ -405,7 +404,7 @@ impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
     fn init(&self, _io: Pin<&'static IO>, _futures: &mut Self::FUTURES) {}
 
     fn with<FUT: Future<Output = TaskEnd> + 'static>(
-        self: Self,
+        self,
         proc: fn(Pin<&'static IO>) -> FUT,
     ) -> impl ProcMachineJobs<IO> {
         ProcMachineJobsExtension { prev: self, proc }
@@ -436,7 +435,7 @@ impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> 
     }
 
     fn with<FUT2: Future<Output = TaskEnd> + 'static>(
-        self: Self,
+        self,
         proc: fn(Pin<&'static IO>) -> FUT2,
     ) -> impl ProcMachineJobs<IO> {
         ProcMachineJobsExtension { prev: self, proc }
@@ -711,8 +710,8 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
 
 /// Trait for types that can be woken by task index.
 ///
-/// Implemented by [`ProcMachineImpl`] to set the corresponding bit in
-/// `wake_mask`.
+/// Implemented by the machine's internal state to set the corresponding bit
+/// in `wake_mask`.
 pub trait MultiWake: Send + Sync {
     /// Signal that the task at index `n` (0–31) should be polled.
     fn wake(&self, n: u8);

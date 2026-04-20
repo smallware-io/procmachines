@@ -104,6 +104,12 @@ const EXCH_DONE: u8 = 6;
 /// [`ExchangeWriteError::ReaderDropped`].
 const EXCH_DROPPED: u8 = 7;
 
+impl Default for IoBytesExchange {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IoBytesExchange {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
@@ -113,6 +119,18 @@ impl IoBytesExchange {
             state: AtomicU8::new(EXCH_EMPTY),
             data: Mutex::new(Bytes::new()),
         }
+    }
+
+    /// Resets the exchange to its initial `EMPTY` state, discarding any
+    /// in-flight data and waking any registered reader or writer so they
+    /// re-poll and observe the fresh state.
+    pub fn reset(&self) {
+        let mut guard = self.data.lock().unwrap();
+        self.state.store(EXCH_EMPTY, Ordering::SeqCst);
+        *guard = Bytes::new();
+        drop(guard);
+        self.reader.wake();
+        self.writer.wake();
     }
 }
 
@@ -218,7 +236,7 @@ impl IoReader for IoBytesExchange {
         let mut guard = self.data.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         match st {
-            EXCH_DROPPED | EXCH_DONE => return,
+            EXCH_DROPPED | EXCH_DONE => (),
             _ => {
                 // Force-terminate: discard any in-flight data and move
                 // to the DROPPED terminal state.
@@ -1277,7 +1295,7 @@ mod tests {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"async-hello");
                 IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1285,7 +1303,7 @@ mod tests {
 
             std::future::poll_fn(|cx| {
                 IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1320,7 +1338,7 @@ mod tests {
                 std::future::poll_fn(|cx| {
                     let mut data = Bytes::from_static(chunk);
                     IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                        r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                        r.map_err(|e| std::io::Error::other(e.to_string()))
                     })
                 })
                 .await
@@ -1328,7 +1346,7 @@ mod tests {
             }
             std::future::poll_fn(|cx| {
                 IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1366,7 +1384,7 @@ mod tests {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"flush-test");
                 IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1375,7 +1393,7 @@ mod tests {
             // Flush — blocks until reader acks.
             std::future::poll_fn(|cx| {
                 IoWriter::prod_poll_flush(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1385,7 +1403,7 @@ mod tests {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"post-flush");
                 IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await
@@ -1393,7 +1411,7 @@ mod tests {
 
             std::future::poll_fn(|cx| {
                 IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    r.map_err(|e| std::io::Error::other(e.to_string()))
                 })
             })
             .await

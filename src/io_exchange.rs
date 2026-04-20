@@ -121,6 +121,12 @@ const EXCH_DONE: u8 = 6;
 /// The reader has been dropped; further writes will error.
 const EXCH_DROPPED: u8 = 7;
 
+impl<ITEM: Send> Default for IoExchange<ITEM> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<ITEM: Send> IoExchange<ITEM> {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
@@ -130,6 +136,18 @@ impl<ITEM: Send> IoExchange<ITEM> {
             state: AtomicU8::new(EXCH_EMPTY),
             item: Mutex::new(None),
         }
+    }
+
+    /// Resets the exchange to its initial `EMPTY` state, discarding any
+    /// in-flight item and waking any registered reader or writer so they
+    /// re-poll and observe the fresh state.
+    pub fn reset(&self) {
+        let mut guard = self.item.lock().unwrap();
+        self.state.store(EXCH_EMPTY, Ordering::SeqCst);
+        *guard = None;
+        drop(guard);
+        self.reader.wake();
+        self.writer.wake();
     }
 }
 
@@ -228,7 +246,7 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
         if let Some(item) = item {
             Poll::Ready(Some(item))
         } else if nextst == EXCH_DONE {
-            return Poll::Ready(None);
+            Poll::Ready(None)
         } else {
             // The state said FULL but the item slot was empty — shouldn't happen
             // in correct usage. Self-wake and pend so the caller retries.
@@ -240,7 +258,7 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
         let mut guard = self.item.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         match st {
-            EXCH_DROPPED | EXCH_DONE => return,
+            EXCH_DROPPED | EXCH_DONE => (),
             _ => {
                 // Move to DROPPED and discard any in-flight item.
                 self.state.store(EXCH_DROPPED, Ordering::Release);

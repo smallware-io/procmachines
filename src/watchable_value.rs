@@ -8,7 +8,7 @@
 //!
 //! # Architecture
 //!
-//! [`WatchNodeValue`] is the [`IntrusiveNodeValue`] implementation that drives
+//! `WatchNodeValue` is the [`IntrusiveNodeValue`] implementation that drives
 //! the list.  Every `WatchableValue` owns a *head* [`IntrusiveListNode`], and
 //! every `ValueWatch` owns a *leaf* node.  The head node's `WatchNodeValue`
 //! contains a [`Mutex`] protecting the current value.
@@ -81,14 +81,14 @@ impl<T: Clone> WatchNodeValue<T> {
     ///
     /// Caller must hold the head mutex.
     unsafe fn wake(&self) {
-        if let WatchNodeValue::Node { waker, .. } = self {
-            if let Some(w) = unsafe { (*waker.get()).take() } {
-                w.wake();
-            }
+        if let WatchNodeValue::Node { waker, .. } = self
+            && let Some(w) = unsafe { (*waker.get()).take() }
+        {
+            w.wake();
         }
     }
 
-    /// Returns a mutable reference to the leaf's stored waker slot.
+    /// Set the node waker.  Only valid on a leaf node
     ///
     /// # Safety
     ///
@@ -99,7 +99,7 @@ impl<T: Clone> WatchNodeValue<T> {
                 match &mut *waker.get() {
                     None => *waker.get() = Some(new_waker.clone()),
                     Some(old_waker) => {
-                        if !new_waker.will_wake(&old_waker) {
+                        if !old_waker.will_wake(new_waker) {
                             *waker.get() = Some(new_waker.clone());
                         }
                     }
@@ -224,7 +224,7 @@ pub struct ValueWatch<'a, T: Clone> {
 impl<'a, T: Clone> ValueWatch<'a, T> {
     /// Creates a new watch against the given pinned watchable value.
     pub fn new(value: Pin<&'a WatchableValue<T>>) -> Self {
-        let head_ref = unsafe { &*Pin::into_inner_unchecked(value) };
+        let head_ref = unsafe { Pin::into_inner_unchecked(value) };
         Self {
             node: IntrusiveListNode::new(WatchNodeValue::new_node(
                 &head_ref.head as *const IntrusiveListNode<WatchNodeValue<T>>,

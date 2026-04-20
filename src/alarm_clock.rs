@@ -9,16 +9,17 @@
 //!
 //! # Architecture
 //!
-//! [`ClockNodeValue`] is the [`IntrusiveNodeValue`] implementation that drives
+//! `ClockNodeValue` is the [`IntrusiveNodeValue`] implementation that drives
 //! the list.  Every `AlarmClock` owns a *head* [`IntrusiveListNode`], and every
 //! `ClockAlarm` owns a *leaf* node.  The head node's `ClockNodeValue` contains
 //! a [`Mutex`] protecting the current clock value; leaf nodes store their alarm
 //! threshold and a [`Waker`] in `UnsafeCell`s.
 //!
 //! When the clock advances, [`AlarmClock::set`] / [`AlarmClock::advance`] walk
-//! the linked list via [`IntrusiveListGuard::filter`] and wake every alarm
-//! whose threshold has been met.  When a `ClockAlarm` is polled, it checks the
-//! threshold under the lock and links itself into the list if it needs to wait.
+//! the linked list via [`crate::intrusive_list::IntrusiveListGuard::filter`]
+//! and wake every alarm whose threshold has been met.  When a `ClockAlarm` is
+//! polled, it checks the threshold under the lock and links itself into the
+//! list if it needs to wait.
 //!
 //! # Safety
 //!
@@ -117,23 +118,45 @@ impl<T: PartialOrd + Clone> ClockNodeValue<T> {
     ///
     /// Caller must hold the head mutex.
     unsafe fn wake(&self) {
-        if let ClockNodeValue::Node { waker, .. } = self {
-            if let Some(w) = unsafe { (*waker.get()).take() } {
-                w.wake();
-            }
+        if let ClockNodeValue::Node { waker, .. } = self
+            && let Some(w) = unsafe { (*waker.get()).take() }
+        {
+            w.wake();
         }
     }
 
-    /// Returns a mutable reference to the leaf's stored waker slot.
+    /// Set the node waker.  Only valid on a leaf node
     ///
     /// # Safety
     ///
     /// Caller must hold the head mutex.  Only valid on leaf nodes.
-    unsafe fn get_waker(&self) -> &mut Option<Waker> {
+    unsafe fn set_waker(&self, new_waker: &Waker) {
         match self {
-            ClockNodeValue::Node { waker, .. } => unsafe { &mut *waker.get() },
-            ClockNodeValue::Head { .. } => panic!("get_waker called on head node"),
-        }
+            ClockNodeValue::Node { waker, .. } => unsafe {
+                match &mut *waker.get() {
+                    None => *waker.get() = Some(new_waker.clone()),
+                    Some(old_waker) => {
+                        if !old_waker.will_wake(new_waker) {
+                            *waker.get() = Some(new_waker.clone());
+                        }
+                    }
+                }
+            },
+            ClockNodeValue::Head { .. } => panic!("set_waker called on head node"),
+        };
+    }
+    /// Clear the node waker.  Only valid on a leaf node
+    ///
+    /// # Safety
+    ///
+    /// Caller must hold the head mutex.  Only valid on leaf nodes.
+    unsafe fn drop_waker(&self) {
+        match self {
+            ClockNodeValue::Node { waker, .. } => unsafe {
+                *waker.get() = None;
+            },
+            ClockNodeValue::Head { .. } => panic!("set_waker called on head node"),
+        };
     }
 }
 
@@ -314,7 +337,7 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
     /// or exceeds it.  Pass `None` to create a disabled alarm that can be armed
     /// later via [`set_alarm`](Self::set_alarm).
     pub fn new(clock: Pin<&'a AlarmClock<T>>, wake_at: Option<T>) -> Self {
-        let head_ref = unsafe { &*Pin::into_inner_unchecked(clock) };
+        let head_ref = unsafe { Pin::into_inner_unchecked(clock) };
         Self {
             node: IntrusiveListNode::new(ClockNodeValue::new_node(
                 &head_ref.head as *const IntrusiveListNode<ClockNodeValue<T>>,
@@ -337,7 +360,7 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
         let guard = self.node.lock_head();
         unsafe {
             guard.unlink(&self.node);
-            *self.node.typ.get_waker() = None;
+            self.node.typ.drop_waker();
             self.node.typ.set_val(wake_at);
         }
     }
@@ -390,19 +413,7 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
 
             // Clock hasn't reached our threshold yet.
             // Store / update the waker so a future clock change can notify us.
-            let waker = self.node.typ.get_waker();
-            match waker {
-                None => {
-                    *waker = Some(cx.waker().clone());
-                }
-                Some(old_waker) => {
-                    let new_waker = cx.waker();
-                    if !old_waker.will_wake(new_waker) {
-                        *waker = Some(new_waker.clone());
-                    }
-                }
-            }
-
+            self.node.typ.set_waker(cx.waker());
             // Link into the list so a future head update can wake us.
             guard.link(&self.node);
         }

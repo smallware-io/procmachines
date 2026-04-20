@@ -3,9 +3,9 @@
 //!
 //! This module provides [`AlarmClock`] and [`ClockAlarm`], a pair of types that
 //! implement an efficient, mutex-synchronized alarm system.  An [`AlarmClock`]
-//! holds a monotonically increasing clock value, and any number of
-//! [`ClockAlarm`] futures can register thresholds to be woken when the clock
-//! reaches or exceeds their target.
+//! holds a clock value that is expected to increase monotonically (but can
+//! be set back if necessary), and any number of [`ClockAlarm`] futures can
+//! register thresholds to be woken when the clock reaches or exceeds their target.
 //!
 //! # Architecture
 //!
@@ -172,9 +172,9 @@ impl<T: PartialOrd + Clone> IntrusiveNodeValue for ClockNodeValue<T> {
 ///
 /// # Pinning
 ///
-/// An `AlarmClock` must be pinned (e.g. via [`pin!`](std::pin::pin) or
-/// [`Box::pin`]) before any [`ClockAlarm`] can be created against it, because
-/// alarms store raw pointers back to the clock's internal node.
+/// An `AlarmClock` must be pinned (e.g. via [`pin!`](std::pin::pin) before
+/// any [`ClockAlarm`] can be created against it, because alarms store raw pointers
+/// back to the clock's internal node.
 ///
 /// # Example
 ///
@@ -194,7 +194,7 @@ pub struct AlarmClock<T: PartialOrd + Clone> {
 }
 
 impl<T: PartialOrd + Clone> AlarmClock<T> {
-    /// Creates a new alarm clock with the given initial value.
+    /// Creates a new alarm clock with the given initial clock value.
     pub fn new(val: T) -> Self {
         Self {
             head: IntrusiveListNode::new(ClockNodeValue::new_head(val)),
@@ -269,12 +269,29 @@ impl<T: PartialOrd + Clone + Debug> Debug for AlarmClock<T> {
 /// A future that resolves when an [`AlarmClock`]'s value reaches a threshold.
 ///
 /// Created via [`ClockAlarm::new`] with a reference to a pinned `AlarmClock`.
-/// The alarm threshold can be changed at any time via [`set`](Self::set), and
-/// setting it to `None` disables the alarm (the future will pend indefinitely).
+/// The alarm threshold can be changed at any time via
+/// [`set_alarm`](Self::set_alarm), and setting it to `None` disables the alarm
+/// (the future will pend indefinitely).
 ///
-/// `ClockAlarm` implements [`Future`], resolving to `()` when the clock value
-/// is `>=` the threshold.  It also provides [`poll_ref`](Self::poll_ref) for
-/// polling through a `Pin<&mut Self>` without consuming the future.
+/// # `alarm_poll` semantics
+///
+/// [`alarm_poll`](Self::alarm_poll) (and the [`Future`] impl, which delegates
+/// to it) monitors an edge-triggered, idempotent event: the clock time first
+/// meeting or exceeding the alarm threshold.
+///
+/// All `alarm_poll*` methods in this crate have "alarm polling" semantics:
+///
+/// - If the condition is **not yet met**, the call returns [`Poll::Pending`]
+///   and the task's waker is registered.  The waker will fire when the clock
+///   advances past the threshold.
+/// - If the condition **is currently met**, the call returns
+///   [`Poll::Ready(())`].  Further calls continue to return `Ready` (the event
+///   is idempotent) until the alarm is reset via [`set_alarm`](Self::set_alarm)
+///   or the clock itself is set back to an earlier value.  The task is not
+///   registered to be woken.
+/// - [`set_alarm`](Self::set_alarm) resets the alarm threshold but **never**
+///   registers or wakes the task — only `alarm_poll` methods do that. If the
+///   task was previously registered to wake, that registration is dropped.
 ///
 /// # Pinning
 ///
@@ -295,7 +312,7 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
     ///
     /// `wake_at` is the threshold value; the alarm fires when the clock reaches
     /// or exceeds it.  Pass `None` to create a disabled alarm that can be armed
-    /// later via [`set`](Self::set).
+    /// later via [`set_alarm`](Self::set_alarm).
     pub fn new(clock: Pin<&'a AlarmClock<T>>, wake_at: Option<T>) -> Self {
         let head_ref = unsafe { &*Pin::into_inner_unchecked(clock) };
         Self {
@@ -309,42 +326,48 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
 
     /// Changes the alarm threshold.
     ///
-    /// If the new threshold is already met by the current clock value, the
-    /// stored waker is invoked immediately.  If set to `None`, the alarm is
-    /// disabled and unlinked from the notification list.
-    pub fn set(&self, wake_at: Option<T>) {
+    /// Any previous registration (waker + list link) is unconditionally
+    /// dropped.  The task will not be woken by a subsequent clock advance
+    /// unless [`alarm_poll`](Self::alarm_poll) is called again to
+    /// re-register.
+    ///
+    /// This method **never** registers or wakes the task — only
+    /// `alarm_poll` methods do that.
+    pub fn set_alarm(&self, wake_at: Option<T>) {
         let guard = self.node.lock_head();
         unsafe {
-            match &wake_at {
-                None => {
-                    guard.unlink(&self.node);
-                }
-                Some(alarm) => {
-                    if *guard >= *alarm {
-                        guard.unlink(&self.node);
-                        self.node.typ.wake();
-                    }
-                }
-            }
+            guard.unlink(&self.node);
+            *self.node.typ.get_waker() = None;
             self.node.typ.set_val(wake_at);
         }
     }
 
     /// Returns the current alarm threshold, or `None` if disabled.
-    pub fn get(&self) -> Option<&T> {
+    pub fn get_alarm(&self) -> Option<&T> {
         let _guard = self.node.lock_head();
         unsafe { self.node.typ.get_val().as_ref() }
     }
 
     /// Polls the alarm without consuming the pin.
     ///
-    /// This is useful when you need to poll the alarm from a `select!` or
+    /// This is the primary polling method for `ClockAlarm`.  It implements
+    /// **alarm_poll** semantics: it waits for an edge-triggered, idempotent
+    /// event — the clock time first meeting or exceeding the alarm threshold.
+    ///
+    /// - Returns [`Poll::Pending`] if the clock has not yet reached the
+    ///   threshold.  The task's waker is registered and will fire when the
+    ///   clock advances past the threshold.
+    /// - Returns [`Poll::Ready(())`] if the threshold is currently met.
+    ///   Further calls continue to return `Ready` until the alarm is reset
+    ///   via [`set_alarm`](Self::set_alarm) or the clock is set back to an
+    ///   earlier value.
+    /// - If the alarm is disabled (`None` threshold), always returns
+    ///   `Pending`.
+    ///
+    /// This method is useful when you need to poll from a `select!` or
     /// similar combinator that provides `&Pin<&mut Self>` rather than
     /// consuming the `Pin<&mut Self>`.
-    ///
-    /// Returns [`Poll::Ready`] if the clock has reached the threshold,
-    /// [`Poll::Pending`] otherwise.
-    pub fn poll_ref(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
+    pub fn alarm_poll(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
         let guard = self.node.lock_head();
         unsafe {
             match self.node.typ.get_val() {
@@ -355,9 +378,11 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
                 }
                 Some(alarm) => {
                     if *guard >= *alarm {
-                        // Threshold reached — unlink, wake, and report ready.
+                        // Threshold met — unlink without registering a waker.
+                        // Any previous waker was already consumed by the clock
+                        // advance that triggered this re-poll, or was never
+                        // stored (first poll with condition already met).
                         guard.unlink(&self.node);
-                        self.node.typ.wake();
                         return Poll::Ready(());
                     }
                 }
@@ -389,7 +414,7 @@ impl<'a, T: PartialOrd + Clone> Future for ClockAlarm<'a, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        self.poll_ref(cx)
+        self.alarm_poll(cx)
     }
 }
 
@@ -441,9 +466,9 @@ mod tests {
         clock.as_ref().get_ref().set(val);
     }
 
-    /// Helper: call ClockAlarm::set through a Pin<&mut ClockAlarm>.
+    /// Helper: call ClockAlarm::set_alarm through a Pin<&mut ClockAlarm>.
     fn alarm_set(alarm: &Pin<&mut ClockAlarm<'_, u64>>, val: Option<u64>) {
-        alarm.as_ref().get_ref().set(val);
+        alarm.as_ref().get_ref().set_alarm(val);
     }
 
     // -----------------------------------------------------------------------
@@ -496,24 +521,24 @@ mod tests {
     fn clock_alarm_new_and_get() {
         let clock = pin!(AlarmClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
-        assert_eq!(alarm.get(), Some(&10));
+        assert_eq!(alarm.get_alarm(), Some(&10));
     }
 
     #[test]
     fn clock_alarm_new_none_threshold() {
         let clock = pin!(AlarmClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), None);
-        assert_eq!(alarm.get(), None);
+        assert_eq!(alarm.get_alarm(), None);
     }
 
     #[test]
     fn clock_alarm_set_threshold() {
         let clock = pin!(AlarmClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
-        alarm.set(Some(20));
-        assert_eq!(alarm.get(), Some(&20));
-        alarm.set(None);
-        assert_eq!(alarm.get(), None);
+        alarm.set_alarm(Some(20));
+        assert_eq!(alarm.get_alarm(), Some(&20));
+        alarm.set_alarm(None);
+        assert_eq!(alarm.get_alarm(), None);
     }
 
     // -----------------------------------------------------------------------
@@ -610,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn set_alarm_to_already_passed_value_wakes() {
+    fn set_alarm_to_already_passed_value_does_not_wake() {
         let clock = pin!(AlarmClock::new(50u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(100));
         let mut alarm = pin!(alarm);
@@ -621,13 +646,12 @@ mod tests {
         assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
         assert_eq!(tw.count(), 0);
 
-        // Change the alarm threshold to something already passed
+        // Change the alarm threshold to something already passed.
+        // set_alarm never wakes — registration is dropped.
         alarm_set(&alarm, Some(30));
+        assert_eq!(tw.count(), 0);
 
-        // set with Now should have woken us
-        assert_eq!(tw.count(), 1);
-
-        // Next poll should be ready
+        // But next poll sees clock(50) >= alarm(30) → Ready
         assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
     }
 
@@ -938,11 +962,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // poll_ref tests
+    // alarm_poll semantics tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn poll_ref_returns_pending_then_ready() {
+    fn ready_is_idempotent() {
+        let clock = pin!(AlarmClock::new(10u64));
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(5));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let waker = Waker::from(tw.clone());
+
+        // Condition is met from the start — Ready every time, no wakes.
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+        assert_eq!(tw.count(), 0);
+    }
+
+    #[test]
+    fn ready_until_clock_set_back() {
+        let clock = pin!(AlarmClock::new(20u64));
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let waker = Waker::from(tw.clone());
+
+        // clock(20) >= alarm(10) → Ready
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+
+        // Set clock back below the threshold
+        clock_set(&clock, 5);
+
+        // Now clock(5) < alarm(10) → Pending
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
+        assert_eq!(tw.count(), 0);
+
+        // Advance past threshold again → wakes
+        clock_set(&clock, 10);
+        assert_eq!(tw.count(), 1);
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn set_alarm_drops_registration() {
+        let clock = pin!(AlarmClock::new(0u64));
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let waker = Waker::from(tw.clone());
+
+        // Register the waker
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
+
+        // set_alarm drops the registration — even though the new threshold
+        // is still not met, the waker is cleared and the node is unlinked.
+        alarm_set(&alarm, Some(20));
+
+        // Advance clock past BOTH old and new thresholds.
+        // The task must NOT be woken because set_alarm dropped the registration.
+        clock_set(&clock, 25);
+        assert_eq!(tw.count(), 0);
+
+        // But alarm_poll sees clock(25) >= alarm(20) → Ready
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn set_alarm_none_drops_registration() {
+        let clock = pin!(AlarmClock::new(0u64));
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let waker = Waker::from(tw.clone());
+
+        // Register the waker
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
+
+        // Disable the alarm — drops registration
+        alarm_set(&alarm, None);
+
+        // Advance clock — task must not be woken
+        clock_set(&clock, 100);
+        assert_eq!(tw.count(), 0);
+
+        // alarm_poll with None threshold → Pending forever
+        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
+    }
+
+    #[test]
+    fn alarm_poll_returns_pending_then_ready() {
         let clock = pin!(AlarmClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
         let mut alarm = pin!(alarm);
@@ -950,8 +1059,8 @@ mod tests {
         let waker = Waker::from(tw.clone());
         let mut cx = Context::from_waker(&waker);
 
-        assert_eq!(alarm.as_mut().poll_ref(&mut cx), Poll::Pending);
+        assert_eq!(alarm.as_mut().alarm_poll(&mut cx), Poll::Pending);
         clock_set(&clock, 10);
-        assert_eq!(alarm.as_mut().poll_ref(&mut cx), Poll::Ready(()));
+        assert_eq!(alarm.as_mut().alarm_poll(&mut cx), Poll::Ready(()));
     }
 }

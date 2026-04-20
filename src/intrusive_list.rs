@@ -319,8 +319,13 @@ mod tests {
     // ── Test fixture ──────────────────────────────────────────────────────
 
     enum TestNode {
-        Head { mutex: Mutex<i32> },
-        Leaf { target: *const IntrusiveListNode<TestNode>, id: i32 },
+        Head {
+            mutex: Mutex<i32>,
+        },
+        Leaf {
+            target: *const IntrusiveListNode<TestNode>,
+            id: i32,
+        },
     }
 
     // SAFETY: The raw pointer in Leaf is only dereferenced while the head

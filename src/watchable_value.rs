@@ -156,6 +156,11 @@ impl<T: Clone> WatchableValue<T> {
     }
 
     /// Sets the value and wakes all watchers.
+    ///
+    /// Every call to `set` counts as a change, regardless of whether the new
+    /// value equals the old.  `T` is therefore not required to implement
+    /// [`PartialEq`] — watchers are woken unconditionally, and the next
+    /// `watch_poll` will return [`Poll::Ready`].
     pub fn set(&self, val: T) {
         let mut guard = self.head.lock_head();
         *guard = val;
@@ -190,9 +195,14 @@ impl<T: Clone + Debug> Debug for WatchableValue<T> {
 /// `WatchableValue`.  Implements [`Future`], resolving to `T` (a clone of the
 /// new value) when the value has changed since the last poll.
 ///
-/// The first poll always returns [`Poll::Ready`].  Subsequent polls return
-/// [`Poll::Ready`] with the new value if it has changed, or [`Poll::Pending`]
-/// if unchanged.
+/// Both [`Future::poll`] and [`ValueWatch::watch_poll`] follow the `watch_poll*`
+/// semantics documented on [`ValueWatch::watch_poll`]: the first poll always
+/// returns [`Poll::Ready`]; subsequent polls return [`Poll::Ready`] only if the
+/// value has changed since the last poll, and [`Poll::Pending`] otherwise.  The
+/// task is always (re-)registered to be woken on the next change, and a
+/// [`Poll::Ready`] result consumes the pending change — callers must be
+/// prepared to process it on the spot, because they will not be notified of it
+/// again.
 ///
 /// After returning [`Poll::Ready`], the watch can be polled again to wait for
 /// the next change.
@@ -223,7 +233,19 @@ impl<'a, T: Clone> ValueWatch<'a, T> {
         }
     }
 
-    pub fn update(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> T {
+    /// Returns the current value and registers the task to be woken on the
+    /// next change.
+    ///
+    /// Behaves like a [`watch_poll`](Self::watch_poll) call that always
+    /// returns [`Poll::Ready`]: any pending change is consumed, the current
+    /// value is returned, and the task is armed for the next change.  Unlike
+    /// `watch_poll`, the caller does not learn whether a change had occurred
+    /// since the last poll.
+    ///
+    /// Useful when the caller wants the current value regardless of whether
+    /// it has changed — for example, to seed local state and arm the watch
+    /// in a single step.
+    pub fn watch_check(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> T {
         let guard = self.node.lock_head();
         unsafe {
             guard.link(&self.node);
@@ -234,9 +256,22 @@ impl<'a, T: Clone> ValueWatch<'a, T> {
 
     /// Polls the watch without consuming the pin.
     ///
-    /// Returns [`Poll::Ready`] with the new value on the first poll or if it has changed since the
-    /// last poll, [`Poll::Pending`] if unchanged.
-    pub fn poll_ref(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+    /// # `watch_poll*` semantics
+    ///
+    /// A `watch_poll*` method checks (or waits) for changes since the last poll:
+    ///
+    /// - The first poll on a watch future always returns [`Poll::Ready`].
+    /// - Subsequent polls return [`Poll::Ready`] if a change has occurred since the
+    ///   last poll, or [`Poll::Pending`] otherwise.
+    /// - In ALL cases, the task is registered to be woken on the next change,
+    ///   even when the method returns [`Poll::Ready`].
+    ///
+    /// Calling a `watch_poll*` method *consumes* any changes since the last poll:
+    /// the next poll will return [`Poll::Pending`] unless further changes have
+    /// occurred.  Callers must therefore be prepared to process the change
+    /// whenever [`Poll::Ready`] is returned, because they will not be notified
+    /// about it again.
+    pub fn watch_poll(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         let guard = self.node.lock_head();
         unsafe {
             let ready = !self.node.is_linked();
@@ -257,7 +292,7 @@ impl<'a, T: Clone> Future for ValueWatch<'a, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        self.poll_ref(cx)
+        self.watch_poll(cx)
     }
 }
 
@@ -425,7 +460,8 @@ mod tests {
 
     #[test]
     fn set_same_value_still_wakes() {
-        // Setting the value, even to the same T, bumps the generation
+        // Setting the value always counts as a change and wakes watchers,
+        // even when the new value equals the old (T: !PartialEq).
         let wv = pin!(WatchableValue::new(42u64));
         let watch = ValueWatch::new(wv.as_ref());
         let mut watch = pin!(watch);
@@ -572,11 +608,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // poll_ref test
+    // watch_poll test
     // -----------------------------------------------------------------------
 
     #[test]
-    fn poll_ref_returns_ready_then_ready() {
+    fn watch_poll_returns_ready_then_ready() {
         let wv = pin!(WatchableValue::new(0u64));
         let watch = ValueWatch::new(wv.as_ref());
         let mut watch = pin!(watch);
@@ -584,9 +620,9 @@ mod tests {
         let waker = Waker::from(tw.clone());
         let mut cx = Context::from_waker(&waker);
 
-        assert_eq!(watch.as_mut().poll_ref(&mut cx), Poll::Ready(0));
+        assert_eq!(watch.as_mut().watch_poll(&mut cx), Poll::Ready(0));
         wv.as_ref().get_ref().set(77);
-        assert_eq!(watch.as_mut().poll_ref(&mut cx), Poll::Ready(77));
+        assert_eq!(watch.as_mut().watch_poll(&mut cx), Poll::Ready(77));
     }
 
     // -----------------------------------------------------------------------

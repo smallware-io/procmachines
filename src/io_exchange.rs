@@ -20,8 +20,8 @@
 //!   (any)  ──drop_read──► DROPPED
 //! ```
 //!
-//! "reader sees" means the reader called [`check_read`](IoStream::check_read)
-//! or [`poll_read`](IoStream::poll_read) and observed the empty slot, which
+//! "reader sees" means the reader called [`con_check_read`](IoStream::con_check_read)
+//! or [`con_poll_read`](IoStream::con_poll_read) and observed the empty slot, which
 //! proves it has consumed everything sent so far.
 //!
 //! # Synchronization
@@ -138,22 +138,23 @@ impl<ITEM: Send> IoExchange<ITEM> {
 // ---------------------------------------------------------------------------
 
 impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
-    fn check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
-        self.reader.register(cx.waker());
+    fn con_check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
         let guard = self.item.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Nothing to read yet.
             EXCH_EMPTY | EXCH_EMPTY_FLUSHED => Poll::Pending,
             EXCH_EMPTY_FLUSH => {
+                self.reader.register(cx.waker());
                 // The writer wants a flush acknowledgement. Transition to
-                // FLUSHED so the writer's next poll_flush sees completion.
-                let _ = self.state.compare_exchange(
-                    st,
-                    EXCH_EMPTY_FLUSHED,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+                // FLUSHED so the writer's next prod_poll_flush sees completion.
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_EMPTY_FLUSHED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    cx.waker().wake_by_ref();
+                }
                 self.writer.wake();
                 Poll::Pending
             }
@@ -170,49 +171,66 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
     /// - `FULL` → `EMPTY` (normal cycle)
     /// - `FULL_FLUSH` → `EMPTY_FLUSH` (item consumed, flush still pending)
     /// - `FULL_CLOSED` → `DONE` (last item consumed, stream ends)
-    fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>> {
-        self.reader.register(cx.waker());
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>> {
         let mut guard = self.item.lock().unwrap();
         let st = self.state.load(Ordering::Acquire);
         let nextst = match st {
             EXCH_EMPTY_FLUSHED => {
+                self.reader.register(cx.waker());
+                if st != self.state.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
+                }
                 return Poll::Pending;
             }
             EXCH_EMPTY | EXCH_EMPTY_FLUSH => {
                 // Acknowledge the flush (reader has seen the empty slot).
-                let _ = self.state.compare_exchange(
-                    st,
-                    EXCH_EMPTY_FLUSHED,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+                self.reader.register(cx.waker());
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_EMPTY_FLUSHED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    cx.waker().wake_by_ref();
+                }
                 self.writer.wake();
                 return Poll::Pending;
             }
             EXCH_FULL => EXCH_EMPTY,
             EXCH_FULL_FLUSH => EXCH_EMPTY_FLUSH,
             EXCH_FULL_CLOSED => EXCH_DONE,
-            // DONE or DROPPED.
+            // DONE or DROPPED — end-of-stream (repeatable).
             _ => {
+                cx.waker().wake_by_ref();
                 return Poll::Ready(None);
             }
         };
 
+        // get item and switch to nextst
+        if self
+            .state
+            .compare_exchange(st, nextst, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
         let item = guard.take();
-        self.state.store(nextst, Ordering::Release);
         self.writer.wake();
         drop(guard);
 
+        // No matter what, we need to pre-wake
+        cx.waker().wake_by_ref();
+
         if let Some(item) = item {
-            return Poll::Ready(Some(item));
-        }
-        // The state said FULL but the item slot was empty — shouldn't happen
-        // in correct usage. If we just transitioned to DONE, report end-of-stream;
-        // otherwise pend so the caller retries.
-        if nextst == EXCH_DONE {
+            Poll::Ready(Some(item))
+        } else if nextst == EXCH_DONE {
             return Poll::Ready(None);
+        } else {
+            // The state said FULL but the item slot was empty — shouldn't happen
+            // in correct usage. Self-wake and pend so the caller retries.
+            Poll::Pending
         }
-        Poll::Pending
     }
 
     fn drop_read(&self) {
@@ -239,13 +257,19 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     type Item = ITEM;
 
     /// Checks whether the slot is empty and ready to accept a new item.
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
-        self.writer.register(cx.waker());
-        match self.state.load(Ordering::Acquire) {
+    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+        let st = self.state.load(Ordering::Acquire);
+        match st {
             // Any empty state means the slot is free.
             EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => Poll::Ready(Ok(())),
             // Slot occupied — wait for the reader to consume.
-            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => Poll::Pending,
+            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
+                self.writer.register(cx.waker());
+                if st != self.state.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
             EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
             _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
         }
@@ -256,12 +280,11 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     /// Uses a compare-exchange on the state to atomically transition from
     /// an empty state to `FULL`. If the CAS fails (e.g. concurrent writer
     /// or reader-side state change), returns an error.
-    fn poll_send(
+    fn prod_poll_send(
         &self,
         cx: &mut Context<'_>,
         item: &mut Option<Self::Item>,
     ) -> Poll<Result<(), ExchangeWriteError>> {
-        self.writer.register(cx.waker());
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
@@ -278,10 +301,19 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
                     self.reader.wake();
                     Poll::Ready(Ok(()))
                 } else {
-                    Poll::Ready(Err(ExchangeWriteError::InvalidState))
+                    // CAS failure under our mutex shouldn't happen in proper
+                    // single-producer usage; stay defensive and re-poll.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
                 }
             }
-            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => Poll::Pending,
+            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
+                self.writer.register(cx.waker());
+                if st != self.state.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
             EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
             _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
         }
@@ -291,59 +323,59 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     ///
     /// Flush is a two-phase handshake:
     /// 1. Writer transitions to a `*_FLUSH` state and wakes the reader.
-    /// 2. Reader observes the empty slot (via `check_read` or `poll_read`)
+    /// 2. Reader observes the empty slot (via `con_check_read` or `con_poll_read`)
     ///    and transitions to `EMPTY_FLUSHED`.
     /// 3. Writer sees `EMPTY_FLUSHED` and returns `Ready`.
     ///
     /// The loop handles CAS retries if the state changes concurrently.
-    fn poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
-        self.writer.register(cx.waker());
-        loop {
-            let st = self.state.load(Ordering::Acquire);
-            match st {
-                // Already in a flush/close state — wait for reader progress.
-                EXCH_EMPTY_FLUSH | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
-                    break Poll::Pending;
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+        let st = self.state.load(Ordering::Acquire);
+        match st {
+            // Already in a flush/close state — wait for reader progress.
+            EXCH_EMPTY_FLUSH | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
+                self.writer.register(cx.waker());
+                if st != self.state.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
                 }
-                // Reader has acknowledged the flush.
-                EXCH_EMPTY_FLUSHED => {
-                    break Ok(()).into();
-                }
-                // Slot is empty — request a flush.
-                EXCH_EMPTY => {
-                    if self
-                        .state
-                        .compare_exchange(st, EXCH_EMPTY_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        self.reader.wake();
-                        break Poll::Pending;
-                    }
+                Poll::Pending
+            }
+            // Reader has acknowledged the flush.
+            EXCH_EMPTY_FLUSHED => Ok(()).into(),
+            // Slot is empty — request a flush.
+            EXCH_EMPTY => {
+                self.writer.register(cx.waker());
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_EMPTY_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.reader.wake();
+                } else {
                     // CAS failed — retry the loop.
+                    cx.waker().wake_by_ref();
                 }
-                // Item still in flight — mark as flush-pending.
-                EXCH_FULL => {
-                    // Hold the lock to prevent the reader from consuming the
-                    // item between our load and our CAS.
-                    let _guard = self.item.lock().unwrap();
-                    if self
-                        .state
-                        .compare_exchange(
-                            EXCH_FULL,
-                            EXCH_FULL_FLUSH,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
-                        .is_ok()
-                    {
-                        self.reader.wake();
-                        break Poll::Pending;
-                    }
+                Poll::Pending
+            }
+            // Item still in flight — mark as flush-pending.
+            EXCH_FULL => {
+                self.writer.register(cx.waker());
+                // Hold the lock to prevent the reader from consuming the
+                // item between our load and our CAS.
+                let _guard = self.item.lock().unwrap();
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_FULL_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.reader.wake();
+                } else {
                     // CAS failed — retry the loop.
+                    cx.waker().wake_by_ref();
                 }
-                // DONE or DROPPED — nothing left to flush.
-                _ => break Ok(()).into(),
-            };
+                Poll::Pending
+            }
+            // DONE or DROPPED — nothing left to flush.
+            _ => Ok(()).into(),
         }
     }
 
@@ -354,43 +386,52 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     /// last item before seeing end-of-stream.
     ///
     /// The loop handles CAS retries.
-    fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
-        self.writer.register(cx.waker());
-        loop {
-            let st = self.state.load(Ordering::Acquire);
-            match st {
-                // Empty (any sub-state) — go straight to DONE.
-                EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
-                    if self
-                        .state
-                        .compare_exchange(st, EXCH_DONE, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        self.reader.wake();
-                        break Ok(()).into();
-                    }
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+        let st = self.state.load(Ordering::Acquire);
+        match st {
+            // Empty (any sub-state) — go straight to DONE.
+            EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_DONE, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.reader.wake();
+                    Ok(()).into()
+                } else {
                     // CAS failed — retry.
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
                 }
-                // Item in flight — mark as "last item, then close".
-                EXCH_FULL | EXCH_FULL_FLUSH => {
-                    // Hold the lock to prevent the reader from consuming the
-                    // item between our load and our CAS.
-                    let _guard = self.item.lock().unwrap();
-                    if self
-                        .state
-                        .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        self.reader.wake();
-                        break Poll::Pending;
-                    }
-                    // CAS failed — retry.
-                }
-                // Already waiting for the reader to take the last item.
-                EXCH_FULL_CLOSED => break Poll::Pending,
-                // DONE or DROPPED — already finished.
-                _ => break Poll::Ready(Ok(())),
             }
+            // Item in flight — mark as "last item, then close".
+            EXCH_FULL | EXCH_FULL_FLUSH => {
+                self.writer.register(cx.waker());
+                // Hold the lock to prevent the reader from consuming the
+                // item between our load and our CAS.
+                let _guard = self.item.lock().unwrap();
+                if self
+                    .state
+                    .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.reader.wake();
+                } else {
+                    // CAS failed — retry.
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            // Already waiting for the reader to take the last item.
+            EXCH_FULL_CLOSED => {
+                self.writer.register(cx.waker());
+                if st != self.state.load(Ordering::Acquire) {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            }
+            // DONE or DROPPED — already finished.
+            _ => Poll::Ready(Ok(())),
         }
     }
 }
@@ -413,27 +454,27 @@ mod tests {
     fn send_receive_single_item() {
         let r = IoExchange::new();
 
-        let pending = with_noop_cx(|cx| r.poll_read(cx));
+        let pending = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(pending, Poll::Pending));
 
-        let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
+        let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(ready, Poll::Ready(Ok(()))));
 
-        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(42))) {
+        match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(42))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
         }
 
-        let pending = with_noop_cx(|cx| r.poll_send_ready(cx));
+        let pending = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(pending, Poll::Pending));
 
-        let next = with_noop_cx(|cx| r.poll_read(cx));
+        let next = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(next, Poll::Ready(Some(42))));
 
-        let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
+        let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(ready, Poll::Ready(Ok(()))));
 
-        let pending = with_noop_cx(|cx| r.poll_read(cx));
+        let pending = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(pending, Poll::Pending));
     }
 
@@ -441,43 +482,43 @@ mod tests {
     fn flush_on_empty_requires_check() {
         let r: IoExchange<i32> = IoExchange::new();
 
-        let flushed = with_noop_cx(|cx| r.poll_flush(cx));
+        let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
 
-        let flushed = with_noop_cx(|cx| r.poll_flush(cx));
+        let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
 
-        let read = with_noop_cx(|cx| r.check_read(cx));
+        let read = with_noop_cx(|cx| r.con_check_read(cx));
         assert!(matches!(read, Poll::Pending));
 
-        let flushed = with_noop_cx(|cx| r.poll_flush(cx));
+        let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Ready(Ok(()))));
 
-        let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
+        let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(ready, Poll::Ready(Ok(()))));
     }
 
     #[test]
     fn flush_waits_for_in_flight_item_and_check() {
         let r = IoExchange::new();
-        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(7))) {
+        match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(7))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
         }
 
-        let pending = with_noop_cx(|cx| r.poll_flush(cx));
+        let pending = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(pending, Poll::Pending));
 
-        let next = with_noop_cx(|cx| r.poll_read(cx));
+        let next = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(next, Poll::Ready(Some(7))));
 
-        let flushed = with_noop_cx(|cx| r.poll_flush(cx));
+        let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
 
-        let next = with_noop_cx(|cx| r.poll_read(cx));
+        let next = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(next, Poll::Pending));
 
-        let flushed = with_noop_cx(|cx| r.poll_flush(cx));
+        let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Ready(Ok(()))));
     }
 
@@ -485,42 +526,42 @@ mod tests {
     fn close_when_empty_finishes_stream() {
         let r: IoExchange<i32> = IoExchange::new();
 
-        let closed = with_noop_cx(|cx| r.poll_close(cx));
+        let closed = with_noop_cx(|cx| r.prod_poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
 
-        let end = with_noop_cx(|cx| r.poll_read(cx));
+        let end = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(end, Poll::Ready(None)));
     }
 
     #[test]
     fn close_after_full_delivers_last_item() {
         let r = IoExchange::new();
-        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(11))) {
+        match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(11))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
         }
 
-        let pending = with_noop_cx(|cx| r.poll_close(cx));
+        let pending = with_noop_cx(|cx| r.prod_poll_close(cx));
         assert!(matches!(pending, Poll::Pending));
 
-        let next = with_noop_cx(|cx| r.poll_read(cx));
+        let next = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(next, Poll::Ready(Some(11))));
 
-        let end = with_noop_cx(|cx| r.poll_read(cx));
+        let end = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(end, Poll::Ready(None)));
 
-        let closed = with_noop_cx(|cx| r.poll_close(cx));
+        let closed = with_noop_cx(|cx| r.prod_poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
     }
 
     #[test]
     fn start_send_on_full_is_invalid_state() {
         let r: IoExchange<i32> = IoExchange::new();
-        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(1))) {
+        match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(1))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
         }
-        match with_noop_cx(|cx| r.poll_send(cx, &mut Some(2))) {
+        match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(2))) {
             Poll::Pending => (),
             _ => panic!(),
         }
@@ -531,12 +572,12 @@ mod tests {
         let r = IoExchange::<i32>::new();
         r.state.store(EXCH_DROPPED, AtomicOrdering::Release);
 
-        let ready = with_noop_cx(|cx| r.poll_send_ready(cx));
+        let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(
             ready,
             Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
         ));
-        let ready = with_noop_cx(|cx| r.poll_send(cx, &mut Some(1)));
+        let ready = with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(1)));
         assert!(matches!(
             ready,
             Poll::Ready(Err(ExchangeWriteError::ReaderDropped))

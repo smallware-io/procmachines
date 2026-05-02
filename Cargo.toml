@@ -14,11 +14,18 @@ categories = ["network-programming", "asynchronous"]
 name = "procmachines"
 path = "src/lib.rs"
 
+[features]
+default = ["std", "tokio"]
+std = []
+tokio = ["dep:tokio", "dep:tokio-util"]
+
 [dependencies]
 futures = "0.3"
 bytes = "1.5"
 bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
 parking_lot = "0.12.5"
+tokio = { version = "1", optional = true }
+tokio-util = { version = "^0.7.0", features=["io"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.41", features = ["rt-multi-thread", "macros"] }

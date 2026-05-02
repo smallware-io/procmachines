@@ -20,9 +20,8 @@
 //!   (any)  ──drop_read──► DROPPED
 //! ```
 //!
-//! "reader sees" means the reader called [`con_check_read`](IoStream::con_check_read)
-//! or [`con_poll_read`](IoStream::con_poll_read) and observed the empty slot, which
-//! proves it has consumed everything sent so far.
+//! "reader sees" means the reader called [`con_poll_read`](IoStream::con_poll_read) and
+//! observed the empty slot, which proves it has consumed everything sent so far.
 //!
 //! # Synchronization
 //!
@@ -155,33 +154,8 @@ impl<ITEM: Send> IoExchange<ITEM> {
 // IoStream (reader side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
-    fn con_check_read(&self, cx: &mut Context<'_>) -> Poll<bool> {
-        let guard = self.item.lock().unwrap();
-        let st = self.state.load(Ordering::Acquire);
-        match st {
-            // Nothing to read yet.
-            EXCH_EMPTY | EXCH_EMPTY_FLUSHED => Poll::Pending,
-            EXCH_EMPTY_FLUSH => {
-                self.reader.register(cx.waker());
-                // The writer wants a flush acknowledgement. Transition to
-                // FLUSHED so the writer's next prod_poll_flush sees completion.
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_EMPTY_FLUSHED, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    cx.waker().wake_by_ref();
-                }
-                self.writer.wake();
-                Poll::Pending
-            }
-            // An item is available.
-            EXCH_FULL | EXCH_FULL_CLOSED | EXCH_FULL_FLUSH => Poll::Ready(guard.is_some()),
-            // DONE or DROPPED — stream is over.
-            _ => Poll::Ready(false),
-        }
-    }
+impl<ITEM: Send> IoStream for IoExchange<ITEM> {
+    type Item = ITEM;
 
     /// Takes the next item from the exchange.
     ///
@@ -273,9 +247,8 @@ impl<ITEM: Send> IoStream<ITEM> for IoExchange<ITEM> {
 // IoSink (writer side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM: Send> IoSink for IoExchange<ITEM> {
+impl<ITEM: Send> IoSink<ITEM> for IoExchange<ITEM> {
     type Error = ExchangeWriteError;
-    type Item = ITEM;
 
     /// Checks whether the slot is empty and ready to accept a new item.
     fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
@@ -304,7 +277,7 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     fn prod_poll_send(
         &self,
         cx: &mut Context<'_>,
-        item: &mut Option<Self::Item>,
+        item: &mut Option<ITEM>,
     ) -> Poll<Result<(), ExchangeWriteError>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
@@ -344,7 +317,7 @@ impl<ITEM: Send> IoSink for IoExchange<ITEM> {
     ///
     /// Flush is a two-phase handshake:
     /// 1. Writer transitions to a `*_FLUSH` state and wakes the reader.
-    /// 2. Reader observes the empty slot (via `con_check_read` or `con_poll_read`)
+    /// 2. Reader observes the empty slot (via `con_poll_read`)
     ///    and transitions to `EMPTY_FLUSHED`.
     /// 3. Writer sees `EMPTY_FLUSHED` and returns `Ready`.
     ///
@@ -509,7 +482,7 @@ mod tests {
         let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
 
-        let read = with_noop_cx(|cx| r.con_check_read(cx));
+        let read = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(read, Poll::Pending));
 
         let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
@@ -625,51 +598,6 @@ mod tests {
         fn wake_by_ref(self: &std::sync::Arc<Self>) {
             self.0.fetch_add(1, AtomicOrdering::SeqCst);
         }
-    }
-
-    #[test]
-    fn con_check_read_does_not_pre_wake() {
-        // con_poll* contract: con_check_read is a state-only probe and
-        // must never pre-wake on Ready, regardless of the returned bool.
-        let r: IoExchange<i32> = IoExchange::new();
-        let cw = CountWaker::new();
-        let w: std::task::Waker = cw.clone().into();
-        let mut cx = Context::from_waker(&w);
-
-        // Ready(true) on FULL.
-        match r.prod_poll_send(&mut cx, &mut Some(1)) {
-            Poll::Ready(Ok(())) => {}
-            other => panic!("expected send Ok, got {:?}", other),
-        }
-        cw.reset();
-        match r.con_check_read(&mut cx) {
-            Poll::Ready(true) => {}
-            other => panic!("expected Ready(true), got {:?}", other),
-        }
-        assert_eq!(
-            cw.count(),
-            0,
-            "con_check_read Ready(true) must not pre-wake"
-        );
-
-        // Consume the item to clear the slot.
-        let _ = r.con_poll_read(&mut cx);
-
-        // Ready(false) on DONE.
-        match r.prod_poll_close(&mut cx) {
-            Poll::Ready(Ok(())) => {}
-            other => panic!("expected close Ok, got {:?}", other),
-        }
-        cw.reset();
-        match r.con_check_read(&mut cx) {
-            Poll::Ready(false) => {}
-            other => panic!("expected Ready(false), got {:?}", other),
-        }
-        assert_eq!(
-            cw.count(),
-            0,
-            "con_check_read Ready(false) must not pre-wake"
-        );
     }
 
     #[test]

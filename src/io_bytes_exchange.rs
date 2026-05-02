@@ -1294,17 +1294,15 @@ mod tests {
         let writer = tokio::spawn(async move {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"async-hello");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_close(&*writer_ex, cx)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
@@ -1337,17 +1335,15 @@ mod tests {
             for chunk in &chunks {
                 std::future::poll_fn(|cx| {
                     let mut data = Bytes::from_static(chunk);
-                    IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                        r.map_err(|e| std::io::Error::other(e.to_string()))
-                    })
+                    IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                        .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
                 })
                 .await
                 .unwrap();
             }
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_close(&*writer_ex, cx)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
@@ -1383,18 +1379,16 @@ mod tests {
             // Send data.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"flush-test");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
 
             // Flush — blocks until reader acks.
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_flush(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_flush(&*writer_ex, cx)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
@@ -1402,17 +1396,15 @@ mod tests {
             // Send more after flush.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"post-flush");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx).map(|r| {
-                    r.map_err(|e| std::io::Error::other(e.to_string()))
-                })
+                IoWriter::prod_poll_close(&*writer_ex, cx)
+                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();

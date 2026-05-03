@@ -22,7 +22,7 @@
 //! `UnsafeCell`.  All mutations go through the head's mutex.  Nodes must be
 //! pinned before linking, because the list stores pointers to their addresses.
 
-use std::{cell::UnsafeCell, marker::PhantomPinned};
+use core::{cell::UnsafeCell, marker::PhantomPinned};
 
 // ---------------------------------------------------------------------------
 // IntrusiveNodeValue — trait for the node-type discriminant
@@ -65,7 +65,7 @@ impl<T> UnsafeLink<T> {
     /// Creates a new null link.
     fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(std::ptr::null()),
+            inner: UnsafeCell::new(core::ptr::null()),
         }
     }
 
@@ -113,7 +113,7 @@ impl<T> UnsafeLink<T> {
     #[inline(always)]
     fn clear(&self) {
         unsafe {
-            *self.inner.get() = std::ptr::null();
+            *self.inner.get() = core::ptr::null();
         }
     }
 }
@@ -130,7 +130,7 @@ pub struct IntrusiveListGuard<'a, V: IntrusiveNodeValue> {
     guard: parking_lot::MutexGuard<'a, V::HeadValue>,
 }
 
-impl<V: IntrusiveNodeValue> std::ops::Deref for IntrusiveListGuard<'_, V> {
+impl<V: IntrusiveNodeValue> core::ops::Deref for IntrusiveListGuard<'_, V> {
     type Target = V::HeadValue;
     #[inline(always)]
     fn deref(&self) -> &V::HeadValue {
@@ -138,7 +138,7 @@ impl<V: IntrusiveNodeValue> std::ops::Deref for IntrusiveListGuard<'_, V> {
     }
 }
 
-impl<V: IntrusiveNodeValue> std::ops::DerefMut for IntrusiveListGuard<'_, V> {
+impl<V: IntrusiveNodeValue> core::ops::DerefMut for IntrusiveListGuard<'_, V> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut V::HeadValue {
         &mut self.guard
@@ -154,7 +154,7 @@ impl<V: IntrusiveNodeValue> IntrusiveListGuard<'_, V> {
     pub fn link(&self, node: &IntrusiveListNode<V>) {
         unsafe {
             assert!(
-                matches!(node.typ.target_node(), Some(h) if std::ptr::eq(h, self.head)),
+                matches!(node.typ.target_node(), Some(h) if core::ptr::eq(h, self.head)),
                 "node does not target this list's head"
             );
             if node.is_linked() {
@@ -187,15 +187,15 @@ impl<V: IntrusiveNodeValue> IntrusiveListGuard<'_, V> {
     /// Panics if `node` is a leaf that does not target this guard's head node.
     pub fn unlink(&self, node: &IntrusiveListNode<V>) {
         unsafe {
-            if std::ptr::eq(node, self.head) {
+            if core::ptr::eq(node, self.head) {
                 // Tearing down the entire list: unlink every leaf until we loop
                 // back to the head, then clear the head's self-link.
-                while !node.next.is_null() && !std::ptr::eq(node.next.get(), self.head) {
+                while !node.next.is_null() && !core::ptr::eq(node.next.get(), self.head) {
                     self.unlink(&*node.next.get());
                 }
             } else {
                 assert!(
-                    matches!(node.typ.target_node(), Some(h) if std::ptr::eq(h, self.head)),
+                    matches!(node.typ.target_node(), Some(h) if core::ptr::eq(h, self.head)),
                     "node does not target this list's head"
                 );
                 if !node.is_linked() {
@@ -228,7 +228,7 @@ impl<V: IntrusiveNodeValue> IntrusiveListGuard<'_, V> {
                 return;
             }
             let mut pn = head.next.get();
-            while !std::ptr::eq(pn, head) {
+            while !core::ptr::eq(pn, head) {
                 let n = &*pn;
                 pn = n.next.get();
                 if !f(&n.typ) {

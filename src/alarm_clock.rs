@@ -29,7 +29,7 @@
 
 use crate::intrusive_list::{IntrusiveListNode, IntrusiveNodeValue};
 use parking_lot::Mutex;
-use std::{
+use core::{
     cell::UnsafeCell,
     fmt::Debug,
     future::Future,
@@ -49,7 +49,7 @@ use std::{
 /// Leaf nodes store an alarm threshold (`Option<T>`), a [`Waker`], and a raw
 /// pointer back to the head node.  `None` disables the alarm; comparisons
 /// use `PartialOrd`.
-enum ClockNodeValue<T: PartialOrd + Clone> {
+enum ClockNodeValue<T> {
     /// The sentinel head node.  Owns the mutex that protects the clock value
     /// and synchronises all list mutations.
     Head { mutex: Mutex<T> },
@@ -65,7 +65,7 @@ enum ClockNodeValue<T: PartialOrd + Clone> {
     },
 }
 
-impl<T: PartialOrd + Clone> ClockNodeValue<T> {
+impl<T> ClockNodeValue<T> {
     /// Creates a head-node value with the given initial clock value.
     fn new_head(val: T) -> Self {
         ClockNodeValue::Head {
@@ -160,7 +160,7 @@ impl<T: PartialOrd + Clone> ClockNodeValue<T> {
     }
 }
 
-impl<T: PartialOrd + Clone> IntrusiveNodeValue for ClockNodeValue<T> {
+impl<T> IntrusiveNodeValue for ClockNodeValue<T> {
     type HeadValue = T;
 
     fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, T> {
@@ -212,7 +212,7 @@ impl<T: PartialOrd + Clone> IntrusiveNodeValue for ClockNodeValue<T> {
 /// clock.set(10);
 /// // `alarm` will resolve on next poll.
 /// ```
-pub struct AlarmClock<T: PartialOrd + Clone> {
+pub struct AlarmClock<T> {
     head: IntrusiveListNode<ClockNodeValue<T>>,
 }
 
@@ -282,7 +282,7 @@ impl<T: PartialOrd + Clone> AlarmClock<T> {
     }
 }
 
-impl<T: PartialOrd + Clone + Debug> Debug for AlarmClock<T> {
+impl<T: Debug> Debug for AlarmClock<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let g = self.head.lock_head();
         f.debug_struct("AlarmClock").field("val", &*g).finish()
@@ -325,12 +325,12 @@ impl<T: PartialOrd + Clone + Debug> Debug for AlarmClock<T> {
 ///
 /// The `'a` lifetime ties this alarm to its parent clock, ensuring the clock
 /// is not dropped while alarms reference it.
-pub struct ClockAlarm<'a, T: PartialOrd + Clone> {
+pub struct ClockAlarm<'a, T> {
     node: IntrusiveListNode<ClockNodeValue<T>>,
     _lifetime: PhantomData<&'a AlarmClock<T>>,
 }
 
-impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
+impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
     /// Creates a new alarm against the given pinned clock.
     ///
     /// `wake_at` is the threshold value; the alarm fires when the clock reaches
@@ -421,7 +421,7 @@ impl<'a, T: PartialOrd + Clone> ClockAlarm<'a, T> {
     }
 }
 
-impl<'a, T: PartialOrd + Clone> Future for ClockAlarm<'a, T> {
+impl<'a, T: PartialOrd> Future for ClockAlarm<'a, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {

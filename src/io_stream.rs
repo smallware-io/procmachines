@@ -7,7 +7,7 @@
 //! The trait is implemented by [`IoExchange`](crate::io_exchange::IoExchange),
 //! which provides the reader half of a single-slot rendezvous channel.
 
-use std::{
+use core::{
     cell::RefCell,
     task::{Context, Poll},
 };
@@ -45,7 +45,7 @@ use futures::{Stream, StreamExt};
 /// the EOS signal and pre-wakes the caller.  The signal is repeatable, so
 /// it is the caller's responsibility to recognise end-of-stream and break
 /// out of any loop that would otherwise consume it forever.
-pub trait IoStream: Send {
+pub trait IoStream {
     /// The type of items produced by the stream.
     type Item;
 
@@ -78,11 +78,11 @@ pub trait IoStream: Send {
  * `reset` can be called at any time to set the inner value, but note that
  * THIS WILL NOT WAKE ANY WAITING READERS.
  */
-pub struct StreamIoStream<STREAM: Stream + Send + Unpin> {
+pub struct StreamIoStream<STREAM> {
     inner: RefCell<Option<STREAM>>,
 }
 
-impl<STREAM: Stream + Send + Unpin> StreamIoStream<STREAM> {
+impl<STREAM: Stream + Unpin> StreamIoStream<STREAM> {
     /// Creates a new `StreamIoStream` wrapping the given stream.
     pub fn new(inner: Option<STREAM>) -> Self {
         Self {
@@ -96,7 +96,7 @@ impl<STREAM: Stream + Send + Unpin> StreamIoStream<STREAM> {
     }
 }
 
-impl<STREAM: Stream + Send + Unpin> IoStream for StreamIoStream<STREAM> {
+impl<STREAM: Stream + Unpin> IoStream for StreamIoStream<STREAM> {
     type Item = STREAM::Item;
 
     fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

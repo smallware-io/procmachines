@@ -17,13 +17,13 @@
 //! drop.  All transitions use compare-and-swap or are performed under the
 //! data mutex to avoid races between the reader and writer.
 
-use std::{
+use core::{
     sync::{
-        Mutex,
         atomic::{AtomicU8, Ordering},
     },
     task::{Context, Poll},
 };
+use parking_lot::Mutex;
 
 use crate::io_exchange::ExchangeWriteError;
 use bytes::Bytes;
@@ -125,7 +125,7 @@ impl IoBytesExchange {
     /// in-flight data and waking any registered reader or writer so they
     /// re-poll and observe the fresh state.
     pub fn reset(&self) {
-        let mut guard = self.data.lock().unwrap();
+        let mut guard = self.data.lock();
         self.state.store(EXCH_EMPTY, Ordering::SeqCst);
         *guard = Bytes::new();
         drop(guard);
@@ -146,7 +146,7 @@ impl IoReader for IoBytesExchange {
     ) -> Poll<std::io::Result<Option<Bytes>>> {
         // Hold the data lock so state and payload stay in sync with the
         // writer during transitions that touch both.
-        let mut guard = self.data.lock().unwrap();
+        let mut guard = self.data.lock();
         let st = self.state.load(Ordering::Acquire);
 
         let nextst = match st {
@@ -212,7 +212,7 @@ impl IoReader for IoBytesExchange {
 
         // Consume up to `max_len` bytes out of the slot.
         let mut data = Bytes::new();
-        std::mem::swap(&mut data, &mut *guard);
+        core::mem::swap(&mut data, &mut *guard);
 
         if data.len() > max_len {
             // Partial read — put the remainder back, stay in FULL* state.
@@ -233,7 +233,7 @@ impl IoReader for IoBytesExchange {
     }
 
     fn drop_read(&self) {
-        let mut guard = self.data.lock().unwrap();
+        let mut guard = self.data.lock();
         let st = self.state.load(Ordering::Acquire);
         match st {
             EXCH_DROPPED | EXCH_DONE => (),
@@ -270,7 +270,7 @@ impl IoWriter for IoBytesExchange {
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let mut guard = self.data.lock().unwrap();
+        let mut guard = self.data.lock();
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Any empty sub-state → place data and move to FULL.
@@ -282,7 +282,7 @@ impl IoWriter for IoBytesExchange {
                 {
                     let sz = data.len();
                     let mut t = Bytes::new();
-                    std::mem::swap(&mut t, data);
+                    core::mem::swap(&mut t, data);
                     *guard = t;
                     self.reader.wake();
                     Poll::Ready(Ok(sz))
@@ -350,7 +350,7 @@ impl IoWriter for IoBytesExchange {
                 self.writer.register(cx.waker());
                 // Hold the data lock so the reader cannot consume the
                 // payload (and change the state) between our load and CAS.
-                let _guard = self.data.lock().unwrap();
+                let _guard = self.data.lock();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
@@ -395,7 +395,7 @@ impl IoWriter for IoBytesExchange {
                 self.writer.register(cx.waker());
                 // Hold the data lock so the reader cannot consume the
                 // payload (and change the state) between our load and CAS.
-                let _guard = self.data.lock().unwrap();
+                let _guard = self.data.lock();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
@@ -481,7 +481,7 @@ mod tests {
     fn new_exchange_starts_empty() {
         let ex = IoBytesExchange::new();
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
-        assert!(ex.data.lock().unwrap().is_empty());
+        assert!(ex.data.lock().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -881,7 +881,7 @@ mod tests {
         IoReader::drop_read(&ex);
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
         // In-flight data should be discarded.
-        assert!(ex.data.lock().unwrap().is_empty());
+        assert!(ex.data.lock().is_empty());
         assert!(ww.count() > 0, "writer should be woken on reader drop");
 
         // Subsequent write returns ReaderDropped.

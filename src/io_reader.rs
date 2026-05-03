@@ -6,7 +6,7 @@
 //! receivers) so that both the reader and writer halves of a channel can
 //! be accessed through a single shared reference.
 
-use std::task::{Context, Poll};
+use core::task::{Context, Poll};
 
 use bytes::Bytes;
 

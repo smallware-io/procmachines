@@ -33,15 +33,14 @@
 //! - `AtomicWaker`s for both sides ensure the other side is notified when
 //!   it can make progress.
 
-use std::{
+use core::{
     fmt::Display,
     sync::{
-        Mutex,
         atomic::{AtomicU8, Ordering},
     },
     task::{Context, Poll},
 };
-
+use parking_lot::Mutex;
 use futures::task::AtomicWaker;
 
 use crate::{io_sink::IoSink, io_stream::IoStream};
@@ -85,7 +84,7 @@ pub enum ExchangeWriteError {
 }
 
 impl Display for ExchangeWriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ExchangeWriteError::ReaderDropped => {
                 write!(f, "Write operation failed -- the reader has been dropped.")
@@ -120,13 +119,13 @@ const EXCH_DONE: u8 = 6;
 /// The reader has been dropped; further writes will error.
 const EXCH_DROPPED: u8 = 7;
 
-impl<ITEM: Send> Default for IoExchange<ITEM> {
+impl<ITEM> Default for IoExchange<ITEM> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<ITEM: Send> IoExchange<ITEM> {
+impl<ITEM> IoExchange<ITEM> {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
         Self {
@@ -141,7 +140,7 @@ impl<ITEM: Send> IoExchange<ITEM> {
     /// in-flight item and waking any registered reader or writer so they
     /// re-poll and observe the fresh state.
     pub fn reset(&self) {
-        let mut guard = self.item.lock().unwrap();
+        let mut guard = self.item.lock();
         self.state.store(EXCH_EMPTY, Ordering::SeqCst);
         *guard = None;
         drop(guard);
@@ -154,7 +153,7 @@ impl<ITEM: Send> IoExchange<ITEM> {
 // IoStream (reader side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM: Send> IoStream for IoExchange<ITEM> {
+impl<ITEM> IoStream for IoExchange<ITEM> {
     type Item = ITEM;
 
     /// Takes the next item from the exchange.
@@ -164,7 +163,7 @@ impl<ITEM: Send> IoStream for IoExchange<ITEM> {
     /// - `FULL_FLUSH` → `EMPTY_FLUSH` (item consumed, flush still pending)
     /// - `FULL_CLOSED` → `DONE` (last item consumed, stream ends)
     fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>> {
-        let mut guard = self.item.lock().unwrap();
+        let mut guard = self.item.lock();
         let st = self.state.load(Ordering::Acquire);
         let nextst = match st {
             EXCH_EMPTY_FLUSHED => {
@@ -229,7 +228,7 @@ impl<ITEM: Send> IoStream for IoExchange<ITEM> {
     }
 
     fn drop_read(&self) {
-        let mut guard = self.item.lock().unwrap();
+        let mut guard = self.item.lock();
         let st = self.state.load(Ordering::Acquire);
         match st {
             EXCH_DROPPED | EXCH_DONE => (),
@@ -247,7 +246,7 @@ impl<ITEM: Send> IoStream for IoExchange<ITEM> {
 // IoSink (writer side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM: Send> IoSink<ITEM> for IoExchange<ITEM> {
+impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
     type Error = ExchangeWriteError;
 
     /// Checks whether the slot is empty and ready to accept a new item.
@@ -282,7 +281,7 @@ impl<ITEM: Send> IoSink<ITEM> for IoExchange<ITEM> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
-        let mut guard = self.item.lock().unwrap();
+        let mut guard = self.item.lock();
         let st = self.state.load(Ordering::Acquire);
         match st {
             EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
@@ -355,7 +354,7 @@ impl<ITEM: Send> IoSink<ITEM> for IoExchange<ITEM> {
                 self.writer.register(cx.waker());
                 // Hold the lock to prevent the reader from consuming the
                 // item between our load and our CAS.
-                let _guard = self.item.lock().unwrap();
+                let _guard = self.item.lock();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
@@ -403,7 +402,7 @@ impl<ITEM: Send> IoSink<ITEM> for IoExchange<ITEM> {
                 self.writer.register(cx.waker());
                 // Hold the lock to prevent the reader from consuming the
                 // item between our load and our CAS.
-                let _guard = self.item.lock().unwrap();
+                let _guard = self.item.lock();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)

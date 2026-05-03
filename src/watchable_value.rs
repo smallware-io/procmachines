@@ -28,7 +28,7 @@
 
 use crate::intrusive_list::{IntrusiveListNode, IntrusiveNodeValue};
 use parking_lot::Mutex;
-use std::{
+use core::{
     cell::UnsafeCell,
     fmt::Debug,
     future::Future,

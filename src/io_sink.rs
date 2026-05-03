@@ -9,7 +9,7 @@
 //! The trait is implemented by [`IoExchange`](crate::io_exchange::IoExchange),
 //! which provides a single-slot rendezvous channel between a writer and reader
 
-use std::{
+use core::{
     cell::RefCell,
     task::{Context, Poll},
 };
@@ -54,7 +54,7 @@ use futures::{Sink, SinkExt};
 /// the producer should eventually end up blocked on an input poll (such as
 /// a `watch_poll*` or other upstream source) — unless it has finished its
 /// task entirely.
-pub trait IoSink<ITEM>: Send {
+pub trait IoSink<ITEM> {
     /// The error type returned by sink operations.
     type Error;
 
@@ -111,9 +111,7 @@ pub trait IoSink<ITEM>: Send {
  *
  * `reset` can be called at any time to set the inner value, but note that THIS WILL NOT WAKE ANY WAITING PRODUCERS.
  */
-pub struct SinkIoSink<ITEM, SINK>
-where
-    SINK: Sink<ITEM> + Send + Unpin,
+pub struct SinkIoSink<ITEM, SINK: Sink<ITEM>>
 {
     inner: RefCell<Option<SINK>>,
     err_fn: fn() -> SINK::Error,
@@ -121,7 +119,7 @@ where
 
 impl<ITEM, SINK> SinkIoSink<ITEM, SINK>
 where
-    SINK: Sink<ITEM> + Send + Unpin,
+    SINK: Sink<ITEM> + Unpin,
 {
     pub fn new(inner: Option<SINK>, err_fn: fn() -> SINK::Error) -> Self {
         Self {
@@ -138,7 +136,7 @@ where
 
 impl<ITEM, SINK> IoSink<ITEM> for SinkIoSink<ITEM, SINK>
 where
-    SINK: Sink<ITEM> + Send + Unpin,
+    SINK: Sink<ITEM> + Unpin,
 {
     type Error = SINK::Error;
 

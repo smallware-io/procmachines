@@ -77,11 +77,11 @@ use bytemuck::{TransparentWrapper, allocation::TransparentWrapperAlloc};
 use core::fmt::Debug;
 use futures::task::AtomicWaker;
 use parking_lot::{Mutex, lock_api::RawMutex as _};
-use std::future::Future;
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
+use core::future::Future;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 // ============================================================================
@@ -95,7 +95,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// advance automatically when the lock is released.
 ///
 /// Callers work with `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
+pub trait ProcMachine<IO>: core::fmt::Debug {
     /// Returns `true` when every internal task has completed.
     ///
     /// Also ticks the machine, so any pending wakes are processed first.
@@ -116,7 +116,7 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     ///
     /// It is only necessary to call this method if the internal tasks could poll
     /// something "external", that can signal outside of `lock()`
-    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()>;
+    fn poll_external(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()>;
 
     /// Acquires the inner mutex and returns a raw pointer to the IO struct.
     ///
@@ -127,7 +127,7 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     /// - The caller **must** call [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)
     ///   exactly once after the critical section, and must not use the
     ///   returned pointer after that call.
-    unsafe fn unsafe_lock_io(&self) -> *mut IO;
+    unsafe fn unsafe_lock_io<'a>(self: Pin<&'a Self>) -> Pin<&'a mut IO>;
 
     /// Ticks the machine and releases the inner mutex.
     ///
@@ -140,20 +140,28 @@ pub trait ProcMachine<IO: Send + Debug>: Send + Sync + core::fmt::Debug {
     unsafe fn unsafe_unlock_io(&self);
 }
 
+pub trait IoGuard<'a, IO>: Deref<Target = IO> + DerefMut<Target = IO> {
+    fn get_pin(&'a self) -> Pin<&'a IO>;
+}
+
 /// Extension trait on `Arc<dyn ProcMachine<IO>>` providing safe lock access.
-pub trait LockableIo<IO: Send + Debug> {
+pub trait LockableIo<IO> {
+    type Guard<'a>: IoGuard<'a, IO>
+    where
+        Self: 'a;
     /// Locks the machine and returns an [`IoGuard`] that derefs to the IO
     /// struct. When the guard is dropped the machine ticks.
-    fn lock(&self) -> IoGuard<IO>;
+    fn lock<'a>(&'a self) -> Self::Guard<'a>;
 }
 
 impl<IO> LockableIo<IO> for Arc<dyn ProcMachine<IO>>
 where
-    IO: Send + Debug,
+    IO: 'static + Send + Debug,
 {
+    type Guard<'a> = IoArcGuard<'a, IO>;
     #[inline(always)]
-    fn lock(&self) -> IoGuard<IO> {
-        IoGuard::new(self.clone())
+    fn lock<'a>(&'a self) -> Self::Guard<'a> {
+        IoArcGuard::new(self.clone())
     }
 }
 
@@ -166,25 +174,31 @@ where
 ///
 /// The guard is `!Send` because `ptr` is a raw pointer, which is correct —
 /// a mutex guard should not be sent to another thread.
-pub struct IoGuard<IO: Send + Debug> {
+pub struct IoArcGuard<'a, IO: Send> {
     holder: Arc<dyn ProcMachine<IO>>,
-    ptr: *mut IO,
+    ptr: Pin<&'a mut IO>,
 }
 
-impl<IO> IoGuard<IO>
-where
-    IO: Send + Debug,
-{
+impl<'a, IO: Send> IoGuard<'a, IO> for IoArcGuard<'a, IO> {
+    fn get_pin(&'a self) -> Pin<&'a IO> {
+        self.ptr.as_ref()
+    }
+}
+
+impl<'a, IO: Send> IoArcGuard<'a, IO> {
     /// Acquires the lock and creates a new guard.
     pub fn new(holder: Arc<dyn ProcMachine<IO>>) -> Self {
-        let ptr = unsafe { holder.unsafe_lock_io() };
+        let ptr = unsafe {
+            let p: *const dyn ProcMachine<IO> = holder.as_ref();
+            Pin::new_unchecked(&*p).unsafe_lock_io()
+        };
         Self { holder, ptr }
     }
 }
 
-impl<IO> Drop for IoGuard<IO>
+impl<'a, IO> Drop for IoArcGuard<'a, IO>
 where
-    IO: Send + Debug,
+    IO: Send,
 {
     /// Ticks the machine and releases the lock.
     #[inline]
@@ -195,24 +209,24 @@ where
     }
 }
 
-impl<IO> Deref for IoGuard<IO>
+impl<'a, IO> Deref for IoArcGuard<'a, IO>
 where
-    IO: Send + Debug,
+    IO: Send,
 {
     type Target = IO;
     #[inline]
     fn deref(&self) -> &IO {
-        unsafe { &*self.ptr }
+        &*self.ptr
     }
 }
 
-impl<IO> DerefMut for IoGuard<IO>
+impl<'a, IO> DerefMut for IoArcGuard<'a, IO>
 where
-    IO: Send + Debug,
+    IO: Send,
 {
     #[inline]
     fn deref_mut(&mut self) -> &mut IO {
-        unsafe { &mut *self.ptr }
+        unsafe { Pin::as_mut(&mut self.ptr).get_unchecked_mut() }
     }
 }
 
@@ -329,7 +343,7 @@ impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMach
                 // SAFETY: The future lives inside ProcMachineInner, which
                 // is inside a Mutex inside an Arc. It is never moved once
                 // initialised, so the Pin invariant holds.
-                let p = unsafe { std::pin::Pin::new_unchecked(fut) };
+                let p = unsafe { core::pin::Pin::new_unchecked(fut) };
                 let mut cx = Context::from_waker(&waker);
 
                 if p.poll(&mut cx).is_ready() {
@@ -611,7 +625,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
             inner: Mutex::new(ProcMachineInner::new(io)),
             wake_mask: AtomicU32::new(0),
             external_waker: AtomicWaker::new(),
-            raw_arc: std::ptr::null(),
+            raw_arc: core::ptr::null(),
         });
         // Store a raw self-pointer for later Arc reconstruction in
         // trait-object methods. Safe because we are the sole owner
@@ -653,12 +667,12 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         !guard.tick(&arc, &self.wake_mask)
     }
 
-    unsafe fn unsafe_lock_io(&self) -> *mut IO {
+    unsafe fn unsafe_lock_io<'a>(self: Pin<&'a Self>) -> Pin<&'a mut IO> {
         // Acquire the raw mutex (not through MutexGuard, because we need
         // to release it in a separate call — unsafe_unlock_io).
         unsafe { self.inner.raw().lock() };
         let inner_ptr = self.inner.data_ptr();
-        unsafe { &mut (*inner_ptr).io }
+        unsafe { Pin::new_unchecked(&mut (*inner_ptr).io) }
     }
 
     unsafe fn unsafe_unlock_io(&self) {
@@ -677,7 +691,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         };
     }
 
-    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_external(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.external_waker.register(cx.waker());
         if (self.wake_mask.load(Ordering::Relaxed) & 0x7FFFFFFF) != 0 {
             unsafe {
@@ -864,7 +878,7 @@ mod tests {
         /// Called by a task inside a `poll_fn` to suspend until the gate
         /// is opened.  Returns `Ready` if the gate is already open
         /// (consuming it), or `Pending` after storing the waker.
-        fn poll_gate(&self, n: usize, cx: &std::task::Context<'_>) -> Poll<()> {
+        fn poll_gate(&self, n: usize, cx: &core::task::Context<'_>) -> Poll<()> {
             let mut slots = self.slots.lock().unwrap();
             if slots[n].open {
                 slots[n].open = false; // consume the gate

@@ -99,7 +99,7 @@ pub trait ProcMachine<IO>: core::fmt::Debug {
     /// Returns `true` when every internal task has completed.
     ///
     /// Also ticks the machine, so any pending wakes are processed first.
-    fn is_done(&self) -> bool;
+    fn is_done(self: Pin<&Self>) -> bool;
 
     /// Check for external wakes to the internal jobs.
     ///
@@ -137,7 +137,7 @@ pub trait ProcMachine<IO>: core::fmt::Debug {
     ///   [`unsafe_lock_io`](ProcMachine::unsafe_lock_io).
     /// - No references derived from the pointer returned by `unsafe_lock_io`
     ///   may be used after this call.
-    unsafe fn unsafe_unlock_io(&self);
+    unsafe fn unsafe_unlock_io<'a>(self: Pin<&'a Self>);
 }
 
 pub trait IoGuard<'a, IO>: Deref<Target = IO> + DerefMut<Target = IO> {
@@ -145,23 +145,29 @@ pub trait IoGuard<'a, IO>: Deref<Target = IO> + DerefMut<Target = IO> {
 }
 
 /// Extension trait on `Arc<dyn ProcMachine<IO>>` providing safe lock access.
-pub trait LockableIo<IO> {
+pub trait ProcMachineHolder<IO> {
     type Guard<'a>: IoGuard<'a, IO>
     where
         Self: 'a;
     /// Locks the machine and returns an [`IoGuard`] that derefs to the IO
     /// struct. When the guard is dropped the machine ticks.
     fn lock<'a>(&'a self) -> Self::Guard<'a>;
+    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>>;
 }
 
-impl<IO> LockableIo<IO> for Arc<dyn ProcMachine<IO>>
+impl<IO> ProcMachineHolder<IO> for Arc<dyn ProcMachine<IO>>
 where
-    IO: 'static + Send + Debug,
+    IO: 'static + Send,
 {
     type Guard<'a> = IoArcGuard<'a, IO>;
     #[inline(always)]
     fn lock<'a>(&'a self) -> Self::Guard<'a> {
         IoArcGuard::new(self.clone())
+    }
+    
+    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>>
+     {
+        return unsafe { Pin::new_unchecked(self.as_ref()) };
     }
 }
 
@@ -174,7 +180,7 @@ where
 ///
 /// The guard is `!Send` because `ptr` is a raw pointer, which is correct —
 /// a mutex guard should not be sent to another thread.
-pub struct IoArcGuard<'a, IO: Send> {
+pub struct IoArcGuard<'a, IO: 'static + Send> {
     holder: Arc<dyn ProcMachine<IO>>,
     ptr: Pin<&'a mut IO>,
 }
@@ -198,13 +204,13 @@ impl<'a, IO: Send> IoArcGuard<'a, IO> {
 
 impl<'a, IO> Drop for IoArcGuard<'a, IO>
 where
-    IO: Send,
+    IO: 'static + Send,
 {
     /// Ticks the machine and releases the lock.
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            self.holder.unsafe_unlock_io();
+            self.holder.get_pin().unsafe_unlock_io();
         }
     }
 }
@@ -655,7 +661,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
 impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachine<IO>
     for ProcMachineImpl<IO, FUTURES>
 {
-    fn is_done(&self) -> bool {
+    fn is_done(self: Pin<&Self>) -> bool {
         // Reconstruct a temporary Arc<Self> for tick(). The
         // increment_strong_count / from_raw pair ensures the ref count
         // nets to zero when the temporary is dropped at the end.
@@ -675,7 +681,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         unsafe { Pin::new_unchecked(&mut (*inner_ptr).io) }
     }
 
-    unsafe fn unsafe_unlock_io(&self) {
+    unsafe fn unsafe_unlock_io<'a>(self: Pin<&'a Self>) {
         // Reconstruct a temporary Arc for tick (same pattern as is_done).
         let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);
@@ -992,7 +998,7 @@ mod tests {
             .with(task_immediate)
             .build(TestIO::new(1));
 
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1010,7 +1016,7 @@ mod tests {
             assert_eq!(guard.counter(), 1); // first half ran
             assert_eq!(guard.completed(), 0);
         }
-        assert!(!machine.is_done());
+        assert!(!machine.get_pin().is_done());
     }
 
     #[test]
@@ -1032,7 +1038,7 @@ mod tests {
             assert_eq!(guard.counter(), 2);
             assert_eq!(guard.completed(), 1);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     #[test]
@@ -1064,7 +1070,7 @@ mod tests {
             let guard = machine.lock();
             assert_eq!(guard.completed(), 1);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1106,7 +1112,7 @@ mod tests {
             assert_eq!(guard.counter(), 22); // +10 from task 1
             assert_eq!(guard.completed(), 3); // both done
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     #[test]
@@ -1127,7 +1133,7 @@ mod tests {
             assert_eq!(guard.counter(), 22);
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     #[test]
@@ -1158,7 +1164,7 @@ mod tests {
             assert_eq!(guard.counter(), 22); // 1+1 + 10+10
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1220,21 +1226,21 @@ mod tests {
             .with(task_suspend_slot1)
             .build(TestIO::new(2));
 
-        assert!(!machine.is_done());
+        assert!(!machine.get_pin().is_done());
 
         // Complete one task — still not done.
         {
             let guard = machine.lock();
             guard.open_gate(0);
         }
-        assert!(!machine.is_done());
+        assert!(!machine.get_pin().is_done());
 
         // Complete the other.
         {
             let guard = machine.lock();
             guard.open_gate(1);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     #[test]
@@ -1248,7 +1254,7 @@ mod tests {
             guard.open_gate(0);
         }
         // is_done calls tick internally before checking.
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1343,7 +1349,7 @@ mod tests {
     fn zero_work_task_completes_at_build() {
         let machine = PROC_MACHINE_JOBS_BASE.with(task_noop).build(TestIO::new(0));
 
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
         let guard = machine.lock();
         assert_eq!(guard.counter(), 0);
     }
@@ -1360,7 +1366,7 @@ mod tests {
             assert_eq!(guard.counter(), 11); // 1 + 10
             assert_eq!(guard.completed(), 1); // only task 0
         }
-        assert!(!machine.is_done());
+        assert!(!machine.get_pin().is_done());
 
         {
             let guard = machine.lock();
@@ -1371,7 +1377,7 @@ mod tests {
             assert_eq!(guard.counter(), 21);
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.is_done());
+        assert!(machine.get_pin().is_done());
     }
 
     #[test]
@@ -1384,7 +1390,7 @@ mod tests {
             let guard = machine.lock();
             assert_eq!(guard.counter(), 1); // no change
         }
-        assert!(!machine.is_done());
+        assert!(!machine.get_pin().is_done());
     }
 
     #[test]

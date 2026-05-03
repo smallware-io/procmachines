@@ -95,7 +95,7 @@ use std::task::{Context, Poll, Wake, Waker};
 /// advance automatically when the lock is released.
 ///
 /// Callers work with `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachine<IO>: core::fmt::Debug {
+pub trait ProcMachine<IO>: core::fmt::Debug + Send + Sync {
     /// Returns `true` when every internal task has completed.
     ///
     /// Also ticks the machine, so any pending wakes are processed first.

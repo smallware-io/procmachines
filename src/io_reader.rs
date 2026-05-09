@@ -10,6 +10,12 @@ use core::task::{Context, Poll};
 
 use bytes::Bytes;
 
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
+
 /// A single-consumer polling trait for reading bytes from an async stream.
 ///
 /// All methods take `&self` (interior mutability), so the reader and its
@@ -82,4 +88,21 @@ pub trait IoReader: Send {
     /// been dropped and will receive appropriate errors on subsequent sends.
     /// Any in-flight data is discarded.
     fn drop_read(&self);
+}
+
+
+impl<T: IoReader + Sync + ?Sized> IoReader for Arc<T> {
+    type Error = T::Error;
+
+    fn con_poll_read(
+        &self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        self.as_ref().con_poll_read(cx, max_len)
+    }
+
+    fn drop_read(&self) {
+        self.as_ref().drop_read()
+    }
 }

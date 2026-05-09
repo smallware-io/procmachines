@@ -10,6 +10,11 @@ use core::task::{Context, Poll};
 
 use bytes::Bytes;
 
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 /// A single-producer polling trait for sending bytes into an async stream.
 ///
 /// All methods take `&self` (interior mutability), so the writer and its
@@ -78,4 +83,26 @@ pub trait IoWriter: Send {
     ///
     /// Returns `Poll::Ready(Ok(()))` once the close is fully acknowledged.
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+
+
+impl<T: IoWriter + Sync + ?Sized> IoWriter for Arc<T> {
+    type Error = T::Error;
+    
+    fn prod_poll_write(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<Result<usize, Self::Error>> {
+        self.as_ref().prod_poll_write(cx, bytes)
+    }
+    
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.as_ref().prod_poll_flush(cx)
+    }
+    
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.as_ref().prod_poll_close(cx)
+    }
 }

@@ -13,6 +13,7 @@ pub trait AsyncBufProvider {
 /// new buffer is required, it attempts to recycle the least-recently returned buffer that
 /// it has.  If its reference to that buffer is not unique, then it will drop it and
 /// allocate a new one.
+#[cfg(feature = "std")]
 pub struct CyclicBufProvider<const COUNT: usize, FALLOC>
 where
     FALLOC: Fn() -> BytesMut,
@@ -23,6 +24,7 @@ where
     f_alloc: FALLOC,
 }
 
+#[cfg(feature = "std")]
 impl<const COUNT: usize, FALLOC> CyclicBufProvider<COUNT, FALLOC>
 where
     FALLOC: Fn() -> BytesMut,
@@ -40,6 +42,7 @@ where
     }
 }
 
+#[cfg(feature = "std")]
 impl<const COUNT: usize, FALLOC> AsyncBufProvider for CyclicBufProvider<COUNT, FALLOC>
 where
     FALLOC: Fn() -> BytesMut,

@@ -18,9 +18,7 @@
 //! data mutex to avoid races between the reader and writer.
 
 use core::{
-    sync::{
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
 use parking_lot::Mutex;
@@ -139,11 +137,13 @@ impl IoBytesExchange {
 // ---------------------------------------------------------------------------
 
 impl IoReader for IoBytesExchange {
+    type Error = core::convert::Infallible;
+
     fn con_poll_read(
         &self,
         cx: &mut Context<'_>,
         max_len: usize,
-    ) -> Poll<std::io::Result<Option<Bytes>>> {
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
         // Hold the data lock so state and payload stay in sync with the
         // writer during transitions that touch both.
         let mut guard = self.data.lock();

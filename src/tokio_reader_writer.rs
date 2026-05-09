@@ -14,8 +14,7 @@ use crate::AsyncBufProvider;
 use crate::IoReader;
 use crate::IoWriter;
 
-/// A wrapper for an internally mutable `Option<R: AsyncRead>` that implements
-/// the [`IoReader`] trait.
+/// A wrapper around an [`AsyncRead`] that implements the [`IoReader`] trait.
 ///
 /// Read buffers are obtained from the supplied [`AsyncBufProvider`].  The
 /// wrapper attempts to amortise allocations by reading additional data into
@@ -25,20 +24,19 @@ use crate::IoWriter;
 ///
 /// # State transitions
 ///
-/// - While the inner reader is `Some(_)`, `con_poll_read` proxies through to
-///   the underlying [`AsyncRead`].
+/// - `con_poll_read` proxies through to the underlying [`AsyncRead`] until
+///   EOF or an error is observed.
 /// - When the underlying reader reports EOF or an error, the wrapper drains
 ///   any remaining buffered bytes first, then surfaces the EOF / error and
-///   sets the inner reader to `None`.
-/// - While the inner reader is `None`, `con_poll_read` is in the EOF
-///   condition: it returns `Ready(Ok(None))` and pre-wakes the caller per
-///   the `con_poll*` contract.  The signal is repeatable.
-/// - [`drop_read`](IoReader::drop_read) sets the inner reader to `None` and
-///   discards any buffered data and pending error.
-/// - [`reset`](Self::reset) replaces the inner reader and clears the
-///   recorded EOF/error, but does **not** wake any task currently parked in
-///   `con_poll_read`.  Any data already in the internal buffer is preserved
-///   and will be returned before the new reader is polled.
+///   drops the inner reader.
+/// - Once the inner reader has been dropped (either by reaching EOF / error,
+///   or by an explicit [`drop_read`](IoReader::drop_read)), `con_poll_read`
+///   is in the EOF condition: it returns `Ready(Ok(None))` and pre-wakes the
+///   caller per the `con_poll*` contract.  The signal is repeatable.
+/// - [`drop_read`](IoReader::drop_read) drops the inner reader and discards
+///   any buffered data and pending error.
+///
+/// The inner reader is supplied at construction time and cannot be replaced.
 pub struct ReaderIoReader<READER, BP>
 where
     READER: AsyncRead + Send + Unpin,
@@ -65,30 +63,17 @@ where
     BP: AsyncBufProvider + Send,
 {
     /// Creates a new `ReaderIoReader` wrapping the given reader and using
-    /// `buf_provider` as the source of read buffers.  Passing `None` for
-    /// `inner` constructs a reader that is already in the EOF condition.
-    pub fn new(inner: Option<READER>, buf_provider: BP) -> Self {
+    /// `buf_provider` as the source of read buffers.
+    pub fn new(inner: READER, buf_provider: BP) -> Self {
         Self {
             inner: RefCell::new(ReaderIoReaderInner {
-                reader: inner,
+                reader: Some(inner),
                 buf_provider,
                 cur_buf: BytesMut::new(),
                 buf_capacity: 0,
                 got_eof: None,
             }),
         }
-    }
-
-    /// Resets the inner reader to a new value, replacing any existing reader.
-    ///
-    /// Clears any recorded EOF / error so that subsequent polls will use the
-    /// new reader.  Any bytes already buffered internally are preserved and
-    /// will be returned before the new reader is polled.  Does **not** wake
-    /// any task currently parked in [`con_poll_read`](IoReader::con_poll_read).
-    pub fn reset(&self, reader: Option<READER>) {
-        let mut guard = self.inner.borrow_mut();
-        guard.reader = reader;
-        guard.got_eof = None;
     }
 }
 
@@ -97,6 +82,8 @@ where
     READER: AsyncRead + Send + Unpin,
     BP: AsyncBufProvider + Send,
 {
+    type Error = std::io::Error;
+
     fn con_poll_read(
         &self,
         cx: &mut Context<'_>,
@@ -182,51 +169,26 @@ where
     }
 }
 
-/// A wrapper for an internally mutable `Option<W: AsyncWrite>` that implements
-/// the [`IoWriter`] trait.
+/// A wrapper around an [`AsyncWrite`] that implements the [`IoWriter`] trait.
 ///
-/// While the inner writer is `Some(_)`, all methods proxy to the underlying
-/// [`AsyncWrite`].  When the inner writer is `None` the wrapper is in the
-/// "closed" state:
-///
-/// - [`prod_poll_write`](IoWriter::prod_poll_write) returns
-///   `Err(ErrorKind::BrokenPipe)`.
-/// - [`prod_poll_flush`](IoWriter::prod_poll_flush) and
-///   [`prod_poll_close`](IoWriter::prod_poll_close) return `Ok(())` — the
-///   sink is already shut down, so there is nothing to do.
-///
-/// When [`prod_poll_close`](IoWriter::prod_poll_close) returns
-/// `Ready(Ok(()))`, the inner value is automatically set to `None` so that
-/// subsequent operations observe the closed state.
-///
-/// [`reset`](Self::reset) can be called at any time to install a new writer,
-/// but it will **not** wake any task currently parked in a `prod_poll*`
-/// method.
+/// All methods proxy to the underlying [`AsyncWrite`]. The inner writer is
+/// supplied at construction time and cannot be replaced.
 pub struct IOWriterWriter<WRITER>
 where
     WRITER: AsyncWrite + Send + Unpin,
 {
-    inner: RefCell<Option<WRITER>>,
+    inner: RefCell<WRITER>,
 }
 
 impl<WRITER> IOWriterWriter<WRITER>
 where
     WRITER: AsyncWrite + Send + Unpin,
 {
-    /// Creates a new `IOWriterWriter` wrapping the given writer.  Passing
-    /// `None` for `inner` constructs a writer that is already in the closed
-    /// state.
-    pub fn new(inner: Option<WRITER>) -> Self {
+    /// Creates a new `IOWriterWriter` wrapping the given writer.
+    pub fn new(inner: WRITER) -> Self {
         Self {
             inner: RefCell::new(inner),
         }
-    }
-
-    /// Resets the inner writer to a new value, replacing any existing writer.
-    ///
-    /// Does **not** wake any task currently parked in a `prod_poll*` method.
-    pub fn reset(&self, writer: Option<WRITER>) {
-        *self.inner.borrow_mut() = writer;
     }
 }
 
@@ -245,39 +207,24 @@ where
             return Poll::Ready(Ok(0));
         }
         let mut inner = self.inner.borrow_mut();
-        match &mut *inner {
-            Some(writer) => match Pin::new(writer).poll_write(cx, bytes.as_ref()) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(sz)) => {
-                    let _ = bytes.split_to(sz);
-                    Poll::Ready(Ok(sz))
-                }
-            },
-            None => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+        match Pin::new(&mut *inner).poll_write(cx, bytes.as_ref()) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(sz)) => {
+                let _ = bytes.split_to(sz);
+                Poll::Ready(Ok(sz))
+            }
         }
     }
 
     fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
-        match &mut *inner {
-            Some(writer) => Pin::new(writer).poll_flush(cx),
-            None => Poll::Ready(Ok(())),
-        }
+        Pin::new(&mut *inner).poll_flush(cx)
     }
 
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
-        match &mut *inner {
-            Some(writer) => {
-                let ret = Pin::new(writer).poll_shutdown(cx);
-                if ret.is_ready() {
-                    *inner = None; // Transition to closed state
-                }
-                ret
-            }
-            None => Poll::Ready(Ok(())),
-        }
+        Pin::new(&mut *inner).poll_shutdown(cx)
     }
 }
 
@@ -505,10 +452,7 @@ mod tests {
             }
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.flush.pop_front() {
                 None | Some(FlushAction::Ok) => Poll::Ready(Ok(())),
                 Some(FlushAction::Pending) => Poll::Pending,
@@ -516,10 +460,7 @@ mod tests {
             }
         }
 
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.shutdown.pop_front() {
                 None | Some(ShutdownAction::Ok) => Poll::Ready(Ok(())),
                 Some(ShutdownAction::Pending) => Poll::Pending,
@@ -533,13 +474,15 @@ mod tests {
     // =======================================================================
 
     // -----------------------------------------------------------------------
-    // Construction with `None` — already at EOF.
+    // After drop_read, the reader is at EOF and the signal is repeatable.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn reader_none_returns_eof_and_pre_wakes() {
+    fn reader_dropped_returns_eof_and_pre_wakes() {
         let bp = MockBufProvider::fixed(64);
-        let r = ReaderIoReader::<MockReader, _>::new(None, bp);
+        let inner = MockReader::new(vec![]);
+        let r = ReaderIoReader::new(inner, bp);
+        r.drop_read();
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -566,7 +509,7 @@ mod tests {
     fn reader_returns_data_then_eof() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"hello".to_vec()), ReadAction::Eof]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -595,7 +538,7 @@ mod tests {
             ReadAction::Data(b"abcdefghij".to_vec()),
             ReadAction::Eof,
         ]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -627,7 +570,7 @@ mod tests {
     fn reader_propagates_pending() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Pending]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -653,7 +596,7 @@ mod tests {
             ReadAction::Data(b"hello".to_vec()),
             ReadAction::Err(io::ErrorKind::ConnectionReset),
         ]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -686,7 +629,7 @@ mod tests {
     fn reader_zero_probe_with_data_is_some_empty_no_prewake() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"xy".to_vec()), ReadAction::Eof]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -700,9 +643,11 @@ mod tests {
         drop(r);
 
         let bp2 = MockBufProvider::fixed(64);
-        let inner2 =
-            MockReader::new(vec![ReadAction::Data(b"abcdef".to_vec()), ReadAction::Pending]);
-        let r2 = ReaderIoReader::new(Some(inner2), bp2);
+        let inner2 = MockReader::new(vec![
+            ReadAction::Data(b"abcdef".to_vec()),
+            ReadAction::Pending,
+        ]);
+        let r2 = ReaderIoReader::new(inner2, bp2);
 
         // First read: cap at 3 so 3 bytes remain in the buffer.
         match r2.con_poll_read(&mut cx, 3) {
@@ -717,7 +662,11 @@ mod tests {
             Poll::Ready(Ok(Some(d))) => assert!(d.is_empty()),
             other => panic!("expected Some(empty), got {:?}", other.map(|_| ())),
         }
-        assert_eq!(cw.count(), 0, "max_len==0 probe with data must not pre-wake");
+        assert_eq!(
+            cw.count(),
+            0,
+            "max_len==0 probe with data must not pre-wake"
+        );
     }
 
     #[test]
@@ -725,7 +674,9 @@ mod tests {
         // EOF probe with max_len == 0: per the trait contract, the EOS
         // signal still counts as consumption and pre-wakes the caller.
         let bp = MockBufProvider::fixed(64);
-        let r = ReaderIoReader::<MockReader, _>::new(None, bp);
+        let inner = MockReader::new(vec![]);
+        let r = ReaderIoReader::new(inner, bp);
+        r.drop_read();
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -744,7 +695,7 @@ mod tests {
     fn reader_drop_read_enters_eof() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"unread".to_vec())]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -757,52 +708,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `reset` installs a new reader and clears recorded EOF/error.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn reader_reset_after_eof_resumes_reading() {
-        let bp = MockBufProvider::fixed(64);
-        let r = ReaderIoReader::<MockReader, _>::new(None, bp);
-        let (_cw, w) = make_waker();
-        let mut cx = Context::from_waker(&w);
-
-        // Initially EOF.
-        assert!(matches!(
-            r.con_poll_read(&mut cx, 1024),
-            Poll::Ready(Ok(None))
-        ));
-
-        // Reset with a new reader.
-        let new_inner = MockReader::new(vec![ReadAction::Data(b"again".to_vec()), ReadAction::Eof]);
-        r.reset(Some(new_inner));
-
-        match r.con_poll_read(&mut cx, 1024) {
-            Poll::Ready(Ok(Some(d))) => assert_eq!(&d[..], b"again"),
-            other => panic!("expected 'again', got {:?}", other.map(|_| ())),
-        }
-        assert!(matches!(
-            r.con_poll_read(&mut cx, 1024),
-            Poll::Ready(Ok(None))
-        ));
-    }
-
-    #[test]
-    fn reader_reset_to_none_enters_eof() {
-        let bp = MockBufProvider::fixed(64);
-        let inner = MockReader::new(vec![ReadAction::Data(b"abc".to_vec()), ReadAction::Eof]);
-        let r = ReaderIoReader::new(Some(inner), bp);
-        let (_cw, w) = make_waker();
-        let mut cx = Context::from_waker(&w);
-
-        r.reset(None);
-        match r.con_poll_read(&mut cx, 1024) {
-            Poll::Ready(Ok(None)) => {}
-            other => panic!("expected EOF, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // BufProvider returning Pending propagates.
     // -----------------------------------------------------------------------
 
@@ -810,7 +715,7 @@ mod tests {
     fn reader_buf_provider_pending_propagates() {
         let bp = MockBufProvider::scripted(vec![BufAction::Pending], 64);
         let inner = MockReader::new(vec![ReadAction::Data(b"x".to_vec())]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -827,12 +732,9 @@ mod tests {
 
     #[test]
     fn reader_zero_capacity_buf_returns_oom() {
-        let bp = MockBufProvider::scripted(
-            vec![BufAction::Buf(BytesMut::with_capacity(0))],
-            0,
-        );
+        let bp = MockBufProvider::scripted(vec![BufAction::Buf(BytesMut::with_capacity(0))], 0);
         let inner = MockReader::new(vec![ReadAction::Data(b"x".to_vec())]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -855,7 +757,7 @@ mod tests {
             ReadAction::Data(b"cc".to_vec()),
             ReadAction::Eof,
         ]);
-        let r = ReaderIoReader::new(Some(inner), bp);
+        let r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -875,12 +777,12 @@ mod tests {
     // =======================================================================
 
     // -----------------------------------------------------------------------
-    // Writing empty bytes is a no-op even when the inner writer is None.
+    // Writing empty bytes is a no-op.
     // -----------------------------------------------------------------------
 
     #[test]
     fn writer_empty_write_is_noop() {
-        let w = IOWriterWriter::<MockWriter>::new(None);
+        let w = IOWriterWriter::new(MockWriter::new());
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -892,25 +794,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Writing to a `None` (closed) inner returns BrokenPipe.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn writer_none_write_returns_broken_pipe() {
-        let w = IOWriterWriter::<MockWriter>::new(None);
-        let (_cw, waker) = make_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let mut payload = Bytes::from_static(b"data");
-        match w.prod_poll_write(&mut cx, &mut payload) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
-            other => panic!("expected BrokenPipe, got {:?}", other.map(|_| ())),
-        }
-        // The payload is left intact when the write fails.
-        assert_eq!(&payload[..], b"data");
-    }
-
-    // -----------------------------------------------------------------------
     // Successful full write — bytes are advanced.
     // -----------------------------------------------------------------------
 
@@ -918,7 +801,7 @@ mod tests {
     fn writer_writes_full_buffer() {
         let mw = MockWriter::new();
         let written = mw.written_handle();
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -939,7 +822,7 @@ mod tests {
     fn writer_partial_write_advances_payload() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Wrote(2)]);
         let written = mw.written_handle();
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -959,7 +842,7 @@ mod tests {
     #[test]
     fn writer_pending_leaves_payload_untouched() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Pending]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -979,7 +862,7 @@ mod tests {
     #[test]
     fn writer_propagates_error() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Err(io::ErrorKind::Other)]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -993,22 +876,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Flush on `None` (closed) is a successful no-op.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn writer_flush_on_none_is_ok() {
-        let w = IOWriterWriter::<MockWriter>::new(None);
-        let (_cw, waker) = make_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        match w.prod_poll_flush(&mut cx) {
-            Poll::Ready(Ok(())) => {}
-            other => panic!("expected Ok(()), got {:?}", other.map(|_| ())),
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Flush proxies to inner.
     // -----------------------------------------------------------------------
 
@@ -1019,7 +886,7 @@ mod tests {
             FlushAction::Ok,
             FlushAction::Err(io::ErrorKind::WriteZero),
         ]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -1032,35 +899,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Close on `None` (already closed) is a successful no-op.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn writer_close_on_none_is_ok() {
-        let w = IOWriterWriter::<MockWriter>::new(None);
-        let (_cw, waker) = make_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        match w.prod_poll_close(&mut cx) {
-            Poll::Ready(Ok(())) => {}
-            other => panic!("expected Ok(()), got {:?}", other.map(|_| ())),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Close pending leaves the inner writer in place.
+    // Close pending leaves the inner writer in place — subsequent writes
+    // still proxy to it.
     // -----------------------------------------------------------------------
 
     #[test]
     fn writer_close_pending_keeps_inner() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Pending]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         assert!(matches!(w.prod_poll_close(&mut cx), Poll::Pending));
-        // After Pending, the writer is still installed — a subsequent write
-        // would still proxy to it (rather than returning BrokenPipe).
         let mut payload = Bytes::from_static(b"x");
         match w.prod_poll_write(&mut cx, &mut payload) {
             Poll::Ready(Ok(1)) => {}
@@ -1072,38 +922,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Successful close transitions to None — subsequent writes see BrokenPipe.
+    // Successful close proxies through.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn writer_close_ok_clears_inner() {
+    fn writer_close_ok() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Ok]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         assert!(matches!(w.prod_poll_close(&mut cx), Poll::Ready(Ok(()))));
-
-        // Subsequent close calls are no-ops on the now-None inner.
-        assert!(matches!(w.prod_poll_close(&mut cx), Poll::Ready(Ok(()))));
-
-        // Writes return BrokenPipe.
-        let mut payload = Bytes::from_static(b"x");
-        match w.prod_poll_write(&mut cx, &mut payload) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
-            other => panic!("expected BrokenPipe, got {:?}", other.map(|_| ())),
-        }
     }
 
     // -----------------------------------------------------------------------
-    // Close error also clears inner (Ready cases set inner = None).
+    // Close error proxies through.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn writer_close_error_clears_inner() {
+    fn writer_close_error_propagates() {
         let mw = MockWriter::new()
             .with_shutdowns(vec![ShutdownAction::Err(io::ErrorKind::ConnectionAborted)]);
-        let w = IOWriterWriter::new(Some(mw));
+        let w = IOWriterWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -1111,49 +951,5 @@ mod tests {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted),
             other => panic!("expected ConnectionAborted, got {:?}", other.map(|_| ())),
         }
-
-        // Inner should now be cleared — writes see BrokenPipe.
-        let mut payload = Bytes::from_static(b"x");
-        match w.prod_poll_write(&mut cx, &mut payload) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
-            other => panic!("expected BrokenPipe, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // `reset` swaps in a new writer.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn writer_reset_replaces_inner() {
-        let w = IOWriterWriter::<MockWriter>::new(None);
-        let (_cw, waker) = make_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        // Initially closed.
-        let mut payload = Bytes::from_static(b"x");
-        assert!(matches!(
-            w.prod_poll_write(&mut cx, &mut payload),
-            Poll::Ready(Err(_))
-        ));
-
-        let mw = MockWriter::new();
-        let written = mw.written_handle();
-        w.reset(Some(mw));
-
-        let mut payload = Bytes::from_static(b"hi");
-        match w.prod_poll_write(&mut cx, &mut payload) {
-            Poll::Ready(Ok(2)) => {}
-            other => panic!("expected Ok(2), got {:?}", other.map(|_| ())),
-        }
-        assert_eq!(&written.lock().unwrap()[..], b"hi");
-
-        // Reset back to None.
-        w.reset(None);
-        let mut payload = Bytes::from_static(b"x");
-        assert!(matches!(
-            w.prod_poll_write(&mut cx, &mut payload),
-            Poll::Ready(Err(_))
-        ));
     }
 }

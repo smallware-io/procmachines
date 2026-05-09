@@ -27,7 +27,6 @@
 //! raw pointers to the nodes' addresses.
 
 use crate::intrusive_list::{IntrusiveListNode, IntrusiveNodeValue};
-use parking_lot::Mutex;
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
@@ -36,6 +35,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // WatchNodeValue — IntrusiveNodeValue implementation
@@ -113,10 +113,10 @@ impl<T: Clone> WatchNodeValue<T> {
 impl<T: Clone> IntrusiveNodeValue for WatchNodeValue<T> {
     type HeadValue = T;
 
-    fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, T> {
+    fn lock_list(&self) -> parking_lot::MutexGuard<'_, T> {
         match self {
             WatchNodeValue::Head { mutex } => mutex.lock(),
-            WatchNodeValue::Node { .. } => panic!("lock_mutex called on leaf node"),
+            WatchNodeValue::Node { .. } => panic!("lock_list called on leaf node"),
         }
     }
 
@@ -181,7 +181,7 @@ impl<T: Clone> WatchableValue<T> {
 }
 
 impl<T: Clone + Debug> Debug for WatchableValue<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let g = self.head.lock_head();
         f.debug_struct("WatchableValue")
             .field("value", &*g)

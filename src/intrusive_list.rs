@@ -42,7 +42,7 @@ pub trait IntrusiveNodeValue: Sized {
     /// # Panics
     ///
     /// Panics if called on a leaf node.
-    fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, Self::HeadValue>;
+    fn lock_list(&self) -> parking_lot::MutexGuard<'_, Self::HeadValue>;
 
     /// Returns the head [`IntrusiveListNode`] that this leaf targets, or
     /// `None` if this is itself a head node.
@@ -281,7 +281,7 @@ impl<V: IntrusiveNodeValue> IntrusiveListNode<V> {
     pub fn lock_head(&self) -> IntrusiveListGuard<'_, V> {
         let head = self.typ.target_node().unwrap_or(self);
         IntrusiveListGuard {
-            guard: head.typ.lock_mutex(),
+            guard: head.typ.lock_list(),
             head,
         }
     }
@@ -336,10 +336,10 @@ mod tests {
     impl IntrusiveNodeValue for TestNode {
         type HeadValue = i32;
 
-        fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, i32> {
+        fn lock_list(&self) -> parking_lot::MutexGuard<'_, i32> {
             match self {
                 TestNode::Head { mutex } => mutex.lock(),
-                TestNode::Leaf { .. } => panic!("lock_mutex called on leaf node"),
+                TestNode::Leaf { .. } => panic!("lock_list called on leaf node"),
             }
         }
 

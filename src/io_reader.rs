@@ -45,6 +45,7 @@ use bytes::Bytes;
 /// end-of-stream and break out of any loop that would otherwise consume it
 /// forever.
 pub trait IoReader: Send {
+    type Error;
     /// Attempts to read the next chunk of bytes from the stream.
     ///
     /// This is the primary read primitive.  The caller specifies the
@@ -73,7 +74,7 @@ pub trait IoReader: Send {
         &self,
         cx: &mut Context<'_>,
         max_len: usize,
-    ) -> Poll<std::io::Result<Option<Bytes>>>;
+    ) -> Poll<Result<Option<Bytes>, Self::Error>>;
 
     /// Signals that the reader is no longer interested in further bytes.
     ///

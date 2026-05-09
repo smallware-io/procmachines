@@ -6,7 +6,7 @@
 //! receivers) and transfers data via [`Bytes`], avoiding copies when the
 //! underlying buffer is reference-counted.
 
-use std::task::{Context, Poll};
+use core::task::{Context, Poll};
 
 use bytes::Bytes;
 

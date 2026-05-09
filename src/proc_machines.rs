@@ -73,16 +73,19 @@
 //! allocates the `Arc<ProcMachineImpl>`, pins the IO, initialises the
 //! futures, and performs the first tick.
 
+#[cfg(not(feature = "std"))]
+use alloc::{sync::Arc, task::Wake};
 use bytemuck::{TransparentWrapper, allocation::TransparentWrapperAlloc};
 use core::fmt::Debug;
-use futures::task::AtomicWaker;
-use parking_lot::{Mutex, lock_api::RawMutex as _};
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use std::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use core::task::{Context, Poll, Waker};
+use futures::task::AtomicWaker;
+use parking_lot::{Mutex, lock_api::RawMutex as _};
+#[cfg(feature = "std")]
+use std::{sync::Arc, task::Wake};
 
 // ============================================================================
 // PUBLIC INTERFACE
@@ -127,7 +130,8 @@ pub trait ProcMachine<IO>: core::fmt::Debug + Send + Sync {
     /// - The caller **must** call [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)
     ///   exactly once after the critical section, and must not use the
     ///   returned pointer after that call.
-    unsafe fn unsafe_lock_io<'a>(self: Pin<&'a Self>) -> Pin<&'a mut IO>;
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn unsafe_lock_io(self: Pin<&Self>) -> Pin<&mut IO>;
 
     /// Ticks the machine and releases the inner mutex.
     ///
@@ -137,7 +141,7 @@ pub trait ProcMachine<IO>: core::fmt::Debug + Send + Sync {
     ///   [`unsafe_lock_io`](ProcMachine::unsafe_lock_io).
     /// - No references derived from the pointer returned by `unsafe_lock_io`
     ///   may be used after this call.
-    unsafe fn unsafe_unlock_io<'a>(self: Pin<&'a Self>);
+    unsafe fn unsafe_unlock_io(self: Pin<&Self>);
 }
 
 pub trait IoGuard<'a, IO>: Deref<Target = IO> + DerefMut<Target = IO> {
@@ -164,10 +168,9 @@ where
     fn lock<'a>(&'a self) -> Self::Guard<'a> {
         IoArcGuard::new(self.clone())
     }
-    
-    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>>
-     {
-        return unsafe { Pin::new_unchecked(self.as_ref()) };
+
+    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>> {
+        unsafe { Pin::new_unchecked(self.as_ref()) }
     }
 }
 
@@ -222,7 +225,7 @@ where
     type Target = IO;
     #[inline]
     fn deref(&self) -> &IO {
-        &*self.ptr
+        &self.ptr
     }
 }
 
@@ -673,7 +676,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         !guard.tick(&arc, &self.wake_mask)
     }
 
-    unsafe fn unsafe_lock_io<'a>(self: Pin<&'a Self>) -> Pin<&'a mut IO> {
+    unsafe fn unsafe_lock_io(self: Pin<&Self>) -> Pin<&mut IO> {
         // Acquire the raw mutex (not through MutexGuard, because we need
         // to release it in a separate call — unsafe_unlock_io).
         unsafe { self.inner.raw().lock() };
@@ -681,7 +684,7 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMach
         unsafe { Pin::new_unchecked(&mut (*inner_ptr).io) }
     }
 
-    unsafe fn unsafe_unlock_io<'a>(self: Pin<&'a Self>) {
+    unsafe fn unsafe_unlock_io(self: Pin<&Self>) {
         // Reconstruct a temporary Arc for tick (same pattern as is_done).
         let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);

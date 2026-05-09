@@ -1,0 +1,5 @@
+[alias]
+# Test-compile the library against a no-std wasm target with default features
+# disabled. Requires the target to be installed:
+#   rustup target add wasm32v1-none
+check-nostd = "check --lib --no-default-features --target wasm32v1-none"

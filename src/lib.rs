@@ -1,5 +1,8 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
 pub mod alarm_clock;
 pub mod buf_provider;
+pub mod connectables;
 pub mod intrusive_list;
 pub mod io_bytes_exchange;
 pub mod io_exchange;
@@ -14,6 +17,7 @@ pub mod watchable_value;
 
 pub use alarm_clock::*;
 pub use buf_provider::*;
+pub use connectables::*;
 pub use io_bytes_exchange::*;
 pub use io_exchange::*;
 pub use io_reader::*;

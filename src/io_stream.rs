@@ -69,30 +69,23 @@ pub trait IoStream {
     fn drop_read(&self);
 }
 
-/**
- * A wrapper for an internally mutable `Option<T: Stream>` the implements the `IoStream` trait.
- *
- * While the inner stream is `None`, the `IoStream` will be in the EOF condition.
- * Calling `drop_read` will set the inner stream to `None`.
- *
- * `reset` can be called at any time to set the inner value, but note that
- * THIS WILL NOT WAKE ANY WAITING READERS.
- */
+/// A wrapper around a [`Stream`] that implements the [`IoStream`] trait.
+///
+/// While the inner stream is present, [`con_poll_read`](IoStream::con_poll_read)
+/// proxies through to it. Calling [`drop_read`](IoStream::drop_read) drops the
+/// inner stream, after which `con_poll_read` returns the EOF signal.
+///
+/// The inner stream is supplied at construction time and cannot be replaced.
 pub struct StreamIoStream<STREAM> {
     inner: RefCell<Option<STREAM>>,
 }
 
 impl<STREAM: Stream + Unpin> StreamIoStream<STREAM> {
     /// Creates a new `StreamIoStream` wrapping the given stream.
-    pub fn new(inner: Option<STREAM>) -> Self {
+    pub fn new(inner: STREAM) -> Self {
         Self {
-            inner: RefCell::new(inner),
+            inner: RefCell::new(Some(inner)),
         }
-    }
-
-    /// Resets the inner stream to a new value, replacing any existing stream.
-    pub fn reset(&self, stream: Option<STREAM>) {
-        *self.inner.borrow_mut() = stream;
     }
 }
 

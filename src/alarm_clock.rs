@@ -28,7 +28,6 @@
 //! raw pointers to the nodes' addresses.
 
 use crate::intrusive_list::{IntrusiveListNode, IntrusiveNodeValue};
-use parking_lot::Mutex;
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
@@ -37,6 +36,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // ClockNodeValue — IntrusiveNodeValue implementation for AlarmClock / ClockAlarm
@@ -163,10 +163,10 @@ impl<T> ClockNodeValue<T> {
 impl<T> IntrusiveNodeValue for ClockNodeValue<T> {
     type HeadValue = T;
 
-    fn lock_mutex(&self) -> parking_lot::MutexGuard<'_, T> {
+    fn lock_list(&self) -> parking_lot::MutexGuard<'_, T> {
         match self {
             ClockNodeValue::Head { mutex } => mutex.lock(),
-            ClockNodeValue::Node { .. } => panic!("lock_mutex called on leaf node"),
+            ClockNodeValue::Node { .. } => panic!("lock_list called on leaf node"),
         }
     }
 
@@ -195,14 +195,14 @@ impl<T> IntrusiveNodeValue for ClockNodeValue<T> {
 ///
 /// # Pinning
 ///
-/// An `AlarmClock` must be pinned (e.g. via [`pin!`](std::pin::pin) before
+/// An `AlarmClock` must be pinned (e.g. via [`pin!`](core::pin::pin) before
 /// any [`ClockAlarm`] can be created against it, because alarms store raw pointers
 /// back to the clock's internal node.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use std::pin::pin;
+/// use core::pin::pin;
 /// use procmachines::{AlarmClock, ClockAlarm};
 ///
 /// let clock = pin!(AlarmClock::new(0u64));
@@ -283,7 +283,7 @@ impl<T: PartialOrd + Clone> AlarmClock<T> {
 }
 
 impl<T: Debug> Debug for AlarmClock<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
         let g = self.head.lock_head();
         f.debug_struct("AlarmClock").field("val", &*g).finish()
     }
@@ -390,7 +390,7 @@ impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
     /// This method is useful when you need to poll from a `select!` or
     /// similar combinator that provides `&Pin<&mut Self>` rather than
     /// consuming the `Pin<&mut Self>`.
-    pub fn alarm_poll(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
+    pub fn alarm_poll(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<()> {
         let guard = self.node.lock_head();
         unsafe {
             match self.node.typ.get_val() {
@@ -424,7 +424,7 @@ impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
 impl<'a, T: PartialOrd> Future for ClockAlarm<'a, T> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
         self.alarm_poll(cx)
     }
 }

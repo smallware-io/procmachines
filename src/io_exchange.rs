@@ -35,13 +35,11 @@
 
 use core::{
     fmt::Display,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
-use parking_lot::Mutex;
 use futures::task::AtomicWaker;
+use parking_lot::Mutex;
 
 use crate::{io_sink::IoSink, io_stream::IoStream};
 

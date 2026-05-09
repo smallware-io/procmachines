@@ -5,7 +5,7 @@
 //! object is provided via `connect`, the registered waker (if any) is woken
 //! and all subsequent calls delegate to that inner object.
 
-use core::cell::RefCell;
+use core::cell::{RefCell, Ref};
 use core::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -86,6 +86,20 @@ impl<T> ConnectableIoSink<T> {
         let mut state = self.state.borrow_mut();
         if matches!(&*state, ConnectableState::Connected(_)) {
             *state = ConnectableState::Disconnected(AtomicWaker::new());
+        }
+    }
+
+    pub fn borrow_inner(&'_ self) -> Option<Ref<'_, T>> {
+        let guard = self.state.borrow();
+        match &*guard {
+            ConnectableState::Connected(_) => Some(Ref::map(guard, |r| {
+                if let ConnectableState::Connected(s) = r {
+                    s
+                } else {
+                    unreachable!()
+                }
+            })),
+            _ => None,
         }
     }
 }
@@ -195,6 +209,21 @@ impl<T> ConnectableIoWriter<T> {
         let mut state = self.state.borrow_mut();
         if matches!(&*state, ConnectableState::Connected(_)) {
             *state = ConnectableState::Disconnected(AtomicWaker::new());
+        }
+    }
+
+
+    pub fn borrow_inner(&'_ self) -> Option<Ref<'_, T>> {
+        let guard = self.state.borrow();
+        match &*guard {
+            ConnectableState::Connected(_) => Some(Ref::map(guard, |r| {
+                if let ConnectableState::Connected(s) = r {
+                    s
+                } else {
+                    unreachable!()
+                }
+            })),
+            _ => None,
         }
     }
 }
@@ -308,6 +337,20 @@ impl<T> ConnectableIoStream<T> {
             _ => {
                 *state = ConnectableConsumerState::Disconnected(AtomicWaker::new());
             }
+        }
+    }
+
+    pub fn borrow_inner(&'_ self) -> Option<Ref<'_, T>> {
+        let guard = self.state.borrow();
+        match &*guard {
+            ConnectableConsumerState::Connected(_) => Some(Ref::map(guard, |r| {
+                if let ConnectableConsumerState::Connected(s) = r {
+                    s
+                } else {
+                    unreachable!()
+                }
+            })),
+            _ => None,
         }
     }
 }
@@ -425,6 +468,20 @@ impl<T> ConnectableIoReader<T> {
             _ => {
                 *state = ConnectableConsumerState::Disconnected(AtomicWaker::new());
             }
+        }
+    }
+    
+    pub fn borrow_inner(&'_ self) -> Option<Ref<'_, T>> {
+        let guard = self.state.borrow();
+        match &*guard {
+            ConnectableConsumerState::Connected(_) => Some(Ref::map(guard, |r| {
+                if let ConnectableConsumerState::Connected(s) = r {
+                    s
+                } else {
+                    unreachable!()
+                }
+            })),
+            _ => None,
         }
     }
 }

@@ -39,31 +39,27 @@ impl<T> Drop for ConnectableState<T> {
 ///
 /// [`reset`](Self::reset) returns the wrapper to the disconnected state and
 /// drops the inner sink.
-pub struct ConnectableIoSink<T: Deref + Send, E: Send> {
+pub struct ConnectableIoSink<T: Deref + Send> {
     state: ConnectableState<T>,
-    _phantom: core::marker::PhantomData<E>
 }
 
-impl<T, U, E> Default for ConnectableIoSink<T,E>
+impl<T> Default for ConnectableIoSink<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
+    T: Deref + Send,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, U, E> ConnectableIoSink<T, E>
+impl<T> ConnectableIoSink<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
+    T: Deref + Send,
 {
     /// Creates a new `ConnectableIoSink` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -90,13 +86,12 @@ where
     }
 }
 
-impl<T, I, U, E> IoSink<I> for ConnectableIoSink<T, E>
+impl<T, I, U> IoSink<I> for ConnectableIoSink<T>
 where
     T: Deref<Target = U> + Send,
-    U: IoSink<I, Error: Into<E>> + ?Sized,
-    E: Send,
+    U: IoSink<I> + ?Sized,
 {
-    type Error = E;
+    type Error = U::Error;
 
     fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match &self.state {
@@ -104,7 +99,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_ready(cx).map_err(Into::into),
+            ConnectableState::Connected(sink) => sink.prod_poll_ready(cx),
         }
     }
 
@@ -118,7 +113,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_send(cx, item).map_err(Into::into),
+            ConnectableState::Connected(sink) => sink.prod_poll_send(cx, item),
         }
     }
 
@@ -128,7 +123,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_flush(cx).map_err(Into::into),
+            ConnectableState::Connected(sink) => sink.prod_poll_flush(cx),
         }
     }
 
@@ -138,7 +133,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_close(cx).map_err(Into::into),
+            ConnectableState::Connected(sink) => sink.prod_poll_close(cx),
         }
     }
 }
@@ -152,33 +147,27 @@ where
 ///
 /// [`reset`](Self::reset) returns the wrapper to the disconnected state and
 /// drops the inner writer.
-pub struct ConnectableIoWriter<T: Deref + Send, E: Send> {
+pub struct ConnectableIoWriter<T: Deref + Send> {
     state: ConnectableState<T>,
-    _phantom: core::marker::PhantomData<E>,
 }
 
-impl<T, U, E> Default for ConnectableIoWriter<T, E>
+impl<T> Default for ConnectableIoWriter<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoWriter<Error: Into<E>> + ?Sized,
+    T: Deref + Send,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, U, E> ConnectableIoWriter<T, E>
+impl<T> ConnectableIoWriter<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoWriter<Error: Into<E>> + ?Sized,
+    T: Deref + Send,
 {
     /// Creates a new `ConnectableIoWriter` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -205,13 +194,12 @@ where
     }
 }
 
-impl<T, U, E> IoWriter for ConnectableIoWriter<T, E>
+impl<T, U> IoWriter for ConnectableIoWriter<T>
 where
     T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoWriter<Error: Into<E>> + ?Sized,
+    U: IoWriter + ?Sized,
 {
-    type Error = E;
+    type Error = U::Error;
 
     fn prod_poll_write(
         &self,
@@ -223,9 +211,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => {
-                writer.prod_poll_write(cx, bytes).map_err(Into::into)
-            }
+            ConnectableState::Connected(writer) => writer.prod_poll_write(cx, bytes),
         }
     }
 
@@ -235,7 +221,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => writer.prod_poll_flush(cx).map_err(Into::into),
+            ConnectableState::Connected(writer) => writer.prod_poll_flush(cx),
         }
     }
 
@@ -245,7 +231,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => writer.prod_poll_close(cx).map_err(Into::into),
+            ConnectableState::Connected(writer) => writer.prod_poll_close(cx),
         }
     }
 }
@@ -263,35 +249,29 @@ where
 /// calls return `Poll::Ready(None)` (the EOS signal), and a later
 /// [`connect`](Self::connect) will immediately call `drop_read` on the
 /// supplied stream and discard it.
-pub struct ConnectableIoStream<T: Deref + Send, E: Send> {
+pub struct ConnectableIoStream<T: Deref + Send> {
     state: ConnectableState<T>,
     drop_pending: AtomicBool,
-    _phantom: core::marker::PhantomData<E>
 }
 
-impl<T, U, E> Default for ConnectableIoStream<T, E>
+impl<T> Default for ConnectableIoStream<T>
 where
-    T: Deref<Target = U> + Send,
-    U: IoStream<Error: Into<E>> + ?Sized,
-    E: Send
+    T: Deref + Send,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, U, E> ConnectableIoStream<T, E>
+impl<T> ConnectableIoStream<T>
 where
-    T: Deref<Target = U> + Send,
-    U: IoStream<Error: Into<E>> + ?Sized,
-    E: Send
+    T: Deref + Send,
 {
     /// Creates a new `ConnectableIoStream` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
             drop_pending: AtomicBool::new(false),
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -308,11 +288,10 @@ where
     }
 }
 
-impl<T, U, E> ConnectableIoStream<T, E>
+impl<T, U> ConnectableIoStream<T>
 where
     T: Deref<Target = U> + Send,
-    U: IoStream<Error: Into<E>> + ?Sized,
-    E: Send
+    U: IoStream + ?Sized,
 {
     /// Connects the wrapper to `stream`.
     ///
@@ -333,14 +312,13 @@ where
     }
 }
 
-impl<T, U, E> IoStream for ConnectableIoStream<T, E>
+impl<T, U> IoStream for ConnectableIoStream<T>
 where
     T: Deref<Target = U> + Send,
-    U: IoStream<Error: Into<E>> + ?Sized,
-    E: Send
+    U: IoStream + ?Sized,
 {
     type Item = U::Item;
-    type Error = E;
+    type Error = U::Error;
 
     fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         match &self.state {
@@ -353,7 +331,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(stream) => stream.con_poll_read(cx).map_err(Into::into),
+            ConnectableState::Connected(stream) => stream.con_poll_read(cx),
         }
     }
 
@@ -383,35 +361,29 @@ where
 /// calls return `Poll::Ready(Ok(None))` (the EOS signal), and a later
 /// [`connect`](Self::connect) will immediately call `drop_read` on the
 /// supplied reader and discard it.
-pub struct ConnectableIoReader<T: Deref + Send, E: Send> {
+pub struct ConnectableIoReader<T: Deref + Send> {
     state: ConnectableState<T>,
     drop_pending: AtomicBool,
-    _phantom: core::marker::PhantomData<E>,
 }
 
-impl<T, U, E> Default for ConnectableIoReader<T, E>
+impl<T> Default for ConnectableIoReader<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoReader<Error: Into<E>> + ?Sized,
+    T: Deref + Send,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, U, E> ConnectableIoReader<T, E>
+impl<T> ConnectableIoReader<T>
 where
-    T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoReader<Error: Into<E>> + ?Sized,
+    T: Deref + Send,
 {
     /// Creates a new `ConnectableIoReader` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
             drop_pending: AtomicBool::new(false),
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -428,11 +400,10 @@ where
     }
 }
 
-impl<T, U, E> ConnectableIoReader<T, E>
+impl<T, U> ConnectableIoReader<T>
 where
     T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoReader<Error: Into<E>> + ?Sized,
+    U: IoReader + ?Sized,
 {
     /// Connects the wrapper to `reader`.
     ///
@@ -454,13 +425,12 @@ where
     }
 }
 
-impl<T, U, E> IoReader for ConnectableIoReader<T, E>
+impl<T, U> IoReader for ConnectableIoReader<T>
 where
     T: Deref<Target = U> + Send,
-    E: Send,
-    U: IoReader<Error: Into<E>> + ?Sized,
+    U: IoReader + ?Sized,
 {
-    type Error = E;
+    type Error = U::Error;
 
     fn con_poll_read(
         &self,
@@ -478,9 +448,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(reader) => {
-                reader.con_poll_read(cx, max_len).map_err(Into::into)
-            }
+            ConnectableState::Connected(reader) => reader.con_poll_read(cx, max_len),
         }
     }
 

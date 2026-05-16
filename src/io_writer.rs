@@ -85,11 +85,9 @@ pub trait IoWriter: Send {
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }
 
-
-
 impl<T: IoWriter + Sync + ?Sized> IoWriter for Arc<T> {
     type Error = T::Error;
-    
+
     fn prod_poll_write(
         &self,
         cx: &mut Context<'_>,
@@ -97,11 +95,11 @@ impl<T: IoWriter + Sync + ?Sized> IoWriter for Arc<T> {
     ) -> Poll<Result<usize, Self::Error>> {
         self.as_ref().prod_poll_write(cx, bytes)
     }
-    
+
     fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.as_ref().prod_poll_flush(cx)
     }
-    
+
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.as_ref().prod_poll_close(cx)
     }

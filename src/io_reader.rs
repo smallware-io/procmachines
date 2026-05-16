@@ -15,7 +15,6 @@ use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-
 /// A single-consumer polling trait for reading bytes from an async stream.
 ///
 /// All methods take `&self` (interior mutability), so the reader and its
@@ -89,7 +88,6 @@ pub trait IoReader: Send {
     /// Any in-flight data is discarded.
     fn drop_read(&self);
 }
-
 
 impl<T: IoReader + Sync + ?Sized> IoReader for Arc<T> {
     type Error = T::Error;

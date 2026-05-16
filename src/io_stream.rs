@@ -48,6 +48,8 @@ use futures::{Stream, StreamExt};
 pub trait IoStream {
     /// The type of items produced by the stream.
     type Item;
+    /// The error type returned by the stream.
+    type Error;
 
     /// Attempts to read the next item from the stream.
     ///
@@ -59,7 +61,7 @@ pub trait IoStream {
     ///   the caller must recognise EOS and break its read loop.
     /// - `Poll::Pending` — no item is available yet.  The waker will be notified
     ///   when the state changes.
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>>;
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>>;
 
     /// Signals that the reader is no longer interested in further items.
     ///
@@ -89,29 +91,38 @@ impl<STREAM: Stream + Unpin> StreamIoStream<STREAM> {
     }
 }
 
-impl<STREAM: Stream + Unpin> IoStream for StreamIoStream<STREAM> {
-    type Item = STREAM::Item;
+impl<STREAM, ITEM, ERR> IoStream for StreamIoStream<STREAM>
+where
+    STREAM: Stream<Item = Result<ITEM, ERR>> + Unpin
+{
+    type Item = ITEM;
+    type Error = ERR;
 
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         let mut inner = self.inner.borrow_mut();
         if let Some(stream) = inner.as_mut() {
             match stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(item)) => {
+                Poll::Ready(Some(Ok(item))) => {
                     // An item was consumed; pre-wake the caller to drain more.
                     cx.waker().wake_by_ref();
-                    Poll::Ready(Some(item))
+                    Poll::Ready(Ok(Some(item)))
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    *inner = None; // Transition to EOF state
+                    cx.waker().wake_by_ref();
+                    Poll::Ready(Err(e))
                 }
                 Poll::Ready(None) => {
                     // End-of-stream; consume the signal and pre-wake the caller.
                     *inner = None; // Transition to EOF state
                     cx.waker().wake_by_ref();
-                    Poll::Ready(None)
+                    Poll::Ready(Ok(None))
                 }
                 Poll::Pending => Poll::Pending,
             }
         } else {
             // Already in EOF state
-            Poll::Ready(None)
+            Poll::Ready(Ok(None))
         }
     }
 

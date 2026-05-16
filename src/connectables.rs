@@ -39,21 +39,31 @@ impl<T> Drop for ConnectableState<T> {
 ///
 /// [`reset`](Self::reset) returns the wrapper to the disconnected state and
 /// drops the inner sink.
-pub struct ConnectableIoSink<T> {
+pub struct ConnectableIoSink<T: Deref + Send, E: Send> {
     state: ConnectableState<T>,
+    _phantom: core::marker::PhantomData<E>
 }
 
-impl<T> Default for ConnectableIoSink<T> {
+impl<T, U, E> Default for ConnectableIoSink<T,E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> ConnectableIoSink<T> {
+impl<T, U, E> ConnectableIoSink<T, E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+{
     /// Creates a new `ConnectableIoSink` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -80,12 +90,13 @@ impl<T> ConnectableIoSink<T> {
     }
 }
 
-impl<ITEM, T, U> IoSink<ITEM> for ConnectableIoSink<T>
+impl<T, I, U, E> IoSink<I> for ConnectableIoSink<T, E>
 where
-    T: Deref<Target = U>,
-    U: IoSink<ITEM> + ?Sized,
+    T: Deref<Target = U> + Send,
+    U: IoSink<I, Error: Into<E>> + ?Sized,
+    E: Send,
 {
-    type Error = U::Error;
+    type Error = E;
 
     fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match &self.state {
@@ -93,21 +104,21 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_ready(cx),
+            ConnectableState::Connected(sink) => sink.prod_poll_ready(cx).map_err(Into::into),
         }
     }
 
     fn prod_poll_send(
         &self,
         cx: &mut Context<'_>,
-        item: &mut Option<ITEM>,
+        item: &mut Option<I>,
     ) -> Poll<Result<(), Self::Error>> {
         match &self.state {
             ConnectableState::Disconnected(waker) => {
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_send(cx, item),
+            ConnectableState::Connected(sink) => sink.prod_poll_send(cx, item).map_err(Into::into),
         }
     }
 
@@ -117,7 +128,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_flush(cx),
+            ConnectableState::Connected(sink) => sink.prod_poll_flush(cx).map_err(Into::into),
         }
     }
 
@@ -127,7 +138,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(sink) => sink.prod_poll_close(cx),
+            ConnectableState::Connected(sink) => sink.prod_poll_close(cx).map_err(Into::into),
         }
     }
 }
@@ -141,21 +152,33 @@ where
 ///
 /// [`reset`](Self::reset) returns the wrapper to the disconnected state and
 /// drops the inner writer.
-pub struct ConnectableIoWriter<T> {
+pub struct ConnectableIoWriter<T: Deref + Send, E: Send> {
     state: ConnectableState<T>,
+    _phantom: core::marker::PhantomData<E>,
 }
 
-impl<T> Default for ConnectableIoWriter<T> {
+impl<T, U, E> Default for ConnectableIoWriter<T, E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+    U: IoWriter<Error: Into<E>> + ?Sized,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> ConnectableIoWriter<T> {
+impl<T, U, E> ConnectableIoWriter<T, E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+    U: IoWriter<Error: Into<E>> + ?Sized,
+{
     /// Creates a new `ConnectableIoWriter` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -182,12 +205,13 @@ impl<T> ConnectableIoWriter<T> {
     }
 }
 
-impl<T, U> IoWriter for ConnectableIoWriter<T>
+impl<T, U, E> IoWriter for ConnectableIoWriter<T, E>
 where
     T: Deref<Target = U> + Send,
-    U: IoWriter + ?Sized,
+    E: Send,
+    U: IoWriter<Error: Into<E>> + ?Sized,
 {
-    type Error = U::Error;
+    type Error = E;
 
     fn prod_poll_write(
         &self,
@@ -199,7 +223,9 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => writer.prod_poll_write(cx, bytes),
+            ConnectableState::Connected(writer) => {
+                writer.prod_poll_write(cx, bytes).map_err(Into::into)
+            }
         }
     }
 
@@ -209,7 +235,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => writer.prod_poll_flush(cx),
+            ConnectableState::Connected(writer) => writer.prod_poll_flush(cx).map_err(Into::into),
         }
     }
 
@@ -219,7 +245,7 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(writer) => writer.prod_poll_close(cx),
+            ConnectableState::Connected(writer) => writer.prod_poll_close(cx).map_err(Into::into),
         }
     }
 }
@@ -237,23 +263,35 @@ where
 /// calls return `Poll::Ready(None)` (the EOS signal), and a later
 /// [`connect`](Self::connect) will immediately call `drop_read` on the
 /// supplied stream and discard it.
-pub struct ConnectableIoStream<T> {
+pub struct ConnectableIoStream<T: Deref + Send, E: Send> {
     state: ConnectableState<T>,
     drop_pending: AtomicBool,
+    _phantom: core::marker::PhantomData<E>
 }
 
-impl<T> Default for ConnectableIoStream<T> {
+impl<T, U, E> Default for ConnectableIoStream<T, E>
+where
+    T: Deref<Target = U> + Send,
+    U: IoStream<Error: Into<E>> + ?Sized,
+    E: Send
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> ConnectableIoStream<T> {
+impl<T, U, E> ConnectableIoStream<T, E>
+where
+    T: Deref<Target = U> + Send,
+    U: IoStream<Error: Into<E>> + ?Sized,
+    E: Send
+{
     /// Creates a new `ConnectableIoStream` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
             drop_pending: AtomicBool::new(false),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -270,10 +308,11 @@ impl<T> ConnectableIoStream<T> {
     }
 }
 
-impl<T, U> ConnectableIoStream<T>
+impl<T, U, E> ConnectableIoStream<T, E>
 where
-    T: Deref<Target = U>,
-    U: IoStream + ?Sized,
+    T: Deref<Target = U> + Send,
+    U: IoStream<Error: Into<E>> + ?Sized,
+    E: Send
 {
     /// Connects the wrapper to `stream`.
     ///
@@ -294,25 +333,27 @@ where
     }
 }
 
-impl<T, U> IoStream for ConnectableIoStream<T>
+impl<T, U, E> IoStream for ConnectableIoStream<T, E>
 where
-    T: Deref<Target = U>,
-    U: IoStream + ?Sized,
+    T: Deref<Target = U> + Send,
+    U: IoStream<Error: Into<E>> + ?Sized,
+    E: Send
 {
     type Item = U::Item;
+    type Error = E;
 
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         match &self.state {
             ConnectableState::Disconnected(waker) => {
                 if self.drop_pending.load(Ordering::Acquire) {
                     // EOS is treated as consumption; pre-wake per the IoStream contract.
                     cx.waker().wake_by_ref();
-                    return Poll::Ready(None);
+                    return Poll::Ready(Ok(None));
                 }
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(stream) => stream.con_poll_read(cx),
+            ConnectableState::Connected(stream) => stream.con_poll_read(cx).map_err(Into::into),
         }
     }
 
@@ -342,23 +383,35 @@ where
 /// calls return `Poll::Ready(Ok(None))` (the EOS signal), and a later
 /// [`connect`](Self::connect) will immediately call `drop_read` on the
 /// supplied reader and discard it.
-pub struct ConnectableIoReader<T> {
+pub struct ConnectableIoReader<T: Deref + Send, E: Send> {
     state: ConnectableState<T>,
     drop_pending: AtomicBool,
+    _phantom: core::marker::PhantomData<E>,
 }
 
-impl<T> Default for ConnectableIoReader<T> {
+impl<T, U, E> Default for ConnectableIoReader<T, E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+    U: IoReader<Error: Into<E>> + ?Sized,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> ConnectableIoReader<T> {
+impl<T, U, E> ConnectableIoReader<T, E>
+where
+    T: Deref<Target = U> + Send,
+    E: Send,
+    U: IoReader<Error: Into<E>> + ?Sized,
+{
     /// Creates a new `ConnectableIoReader` in the disconnected state.
     pub fn new() -> Self {
         Self {
             state: ConnectableState::Disconnected(AtomicWaker::new()),
             drop_pending: AtomicBool::new(false),
+            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -375,10 +428,11 @@ impl<T> ConnectableIoReader<T> {
     }
 }
 
-impl<T, U> ConnectableIoReader<T>
+impl<T, U, E> ConnectableIoReader<T, E>
 where
-    T: Deref<Target = U>,
-    U: IoReader + ?Sized,
+    T: Deref<Target = U> + Send,
+    E: Send,
+    U: IoReader<Error: Into<E>> + ?Sized,
 {
     /// Connects the wrapper to `reader`.
     ///
@@ -400,12 +454,13 @@ where
     }
 }
 
-impl<T, U> IoReader for ConnectableIoReader<T>
+impl<T, U, E> IoReader for ConnectableIoReader<T, E>
 where
     T: Deref<Target = U> + Send,
-    U: IoReader + ?Sized,
+    E: Send,
+    U: IoReader<Error: Into<E>> + ?Sized,
 {
-    type Error = U::Error;
+    type Error = E;
 
     fn con_poll_read(
         &self,
@@ -423,7 +478,9 @@ where
                 waker.register(cx.waker());
                 Poll::Pending
             }
-            ConnectableState::Connected(reader) => reader.con_poll_read(cx, max_len),
+            ConnectableState::Connected(reader) => {
+                reader.con_poll_read(cx, max_len).map_err(Into::into)
+            }
         }
     }
 

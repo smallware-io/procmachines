@@ -153,6 +153,7 @@ impl<ITEM> IoExchange<ITEM> {
 
 impl<ITEM> IoStream for IoExchange<ITEM> {
     type Item = ITEM;
+    type Error = ();
 
     /// Takes the next item from the exchange.
     ///
@@ -160,7 +161,7 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
     /// - `FULL` → `EMPTY` (normal cycle)
     /// - `FULL_FLUSH` → `EMPTY_FLUSH` (item consumed, flush still pending)
     /// - `FULL_CLOSED` → `DONE` (last item consumed, stream ends)
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<ITEM>> {
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<ITEM>, Self::Error>> {
         let mut guard = self.item.lock();
         let st = self.state.load(Ordering::Acquire);
         let nextst = match st {
@@ -187,12 +188,13 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
             EXCH_FULL => EXCH_EMPTY,
             EXCH_FULL_FLUSH => EXCH_EMPTY_FLUSH,
             EXCH_FULL_CLOSED => EXCH_DONE,
-            // DONE or DROPPED — end-of-stream (repeatable).  Each return
-            // counts as consuming one repetition of the EOS signal, so
-            // pre-wake per the con_poll* contract.
-            _ => {
+            EXCH_DONE => {
                 cx.waker().wake_by_ref();
-                return Poll::Ready(None);
+                return Poll::Ready(Ok(None));
+            }
+            // DROPPED
+            _ => {
+                return Poll::Ready(Err(()));
             }
         };
 
@@ -215,9 +217,9 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
         cx.waker().wake_by_ref();
 
         if let Some(item) = item {
-            Poll::Ready(Some(item))
+            Poll::Ready(Ok(Some(item)))
         } else if nextst == EXCH_DONE {
-            Poll::Ready(None)
+            Poll::Ready(Ok(None))
         } else {
             // The state said FULL but the item slot was empty — shouldn't happen
             // in correct usage. Self-wake and pend so the caller retries.
@@ -460,7 +462,7 @@ mod tests {
         assert!(matches!(pending, Poll::Pending));
 
         let next = with_noop_cx(|cx| r.con_poll_read(cx));
-        assert!(matches!(next, Poll::Ready(Some(42))));
+        assert!(matches!(next, Poll::Ready(Ok(Some(42)))));
 
         let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
         assert!(matches!(ready, Poll::Ready(Ok(()))));
@@ -501,7 +503,7 @@ mod tests {
         assert!(matches!(pending, Poll::Pending));
 
         let next = with_noop_cx(|cx| r.con_poll_read(cx));
-        assert!(matches!(next, Poll::Ready(Some(7))));
+        assert!(matches!(next, Poll::Ready(Ok(Some(7)))));
 
         let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
@@ -521,7 +523,7 @@ mod tests {
         assert!(matches!(closed, Poll::Ready(Ok(()))));
 
         let end = with_noop_cx(|cx| r.con_poll_read(cx));
-        assert!(matches!(end, Poll::Ready(None)));
+        assert!(matches!(end, Poll::Ready(Ok(None))));
     }
 
     #[test]
@@ -536,10 +538,10 @@ mod tests {
         assert!(matches!(pending, Poll::Pending));
 
         let next = with_noop_cx(|cx| r.con_poll_read(cx));
-        assert!(matches!(next, Poll::Ready(Some(11))));
+        assert!(matches!(next, Poll::Ready(Ok(Some(11)))));
 
         let end = with_noop_cx(|cx| r.con_poll_read(cx));
-        assert!(matches!(end, Poll::Ready(None)));
+        assert!(matches!(end, Poll::Ready(Ok(None))));
 
         let closed = with_noop_cx(|cx| r.prod_poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
@@ -612,7 +614,7 @@ mod tests {
         }
         cw.reset();
         match r.con_poll_read(&mut cx) {
-            Poll::Ready(Some(99)) => {}
+            Poll::Ready(Ok(Some(99))) => {}
             other => panic!("expected Ready(Some(99)), got {:?}", other),
         }
         assert!(cw.count() > 0, "consuming an item must pre-wake");
@@ -623,7 +625,7 @@ mod tests {
         }
         cw.reset();
         match r.con_poll_read(&mut cx) {
-            Poll::Ready(None) => {}
+            Poll::Ready(Ok(None)) => {}
             other => panic!("expected Ready(None), got {:?}", other),
         }
         assert!(cw.count() > 0, "consuming EOS must pre-wake");

@@ -11,6 +11,7 @@ use tokio::io::AsyncWrite;
 use tokio_util::io::poll_read_buf;
 
 use crate::AsyncBufProvider;
+use crate::IoError;
 use crate::IoReader;
 use crate::IoWriter;
 
@@ -54,7 +55,7 @@ where
     buf_provider: BP,
     cur_buf: BytesMut,
     buf_capacity: usize,
-    got_eof: Option<Option<std::io::Error>>,
+    got_eof: Option<Option<IoError>>,
 }
 
 impl<READER, BP> ReaderIoReader<READER, BP>
@@ -82,13 +83,13 @@ where
     READER: AsyncRead + Send + Unpin,
     BP: AsyncBufProvider + Send,
 {
-    type Error = std::io::Error;
+    type Error = IoError;
 
     fn con_poll_read(
         &self,
         cx: &mut Context<'_>,
         max_len: usize,
-    ) -> Poll<std::io::Result<Option<Bytes>>> {
+    ) -> Poll<Result<Option<Bytes>, IoError>> {
         let mut inner = self.inner.borrow_mut();
         if inner.reader.is_none() {
             // Already in EOF state; one repetition of the EOS signal is
@@ -129,7 +130,7 @@ where
                         im.got_eof = Some(None);
                     }
                     Poll::Ready(Err(e)) => {
-                        im.got_eof = Some(Some(e));
+                        im.got_eof = Some(Some(e.into()));
                     }
                     _ => {}
                 }
@@ -173,18 +174,18 @@ where
 ///
 /// All methods proxy to the underlying [`AsyncWrite`]. The inner writer is
 /// supplied at construction time and cannot be replaced.
-pub struct IOWriterWriter<WRITER>
+pub struct WriterIoWriter<WRITER>
 where
     WRITER: AsyncWrite + Send + Unpin,
 {
     inner: RefCell<WRITER>,
 }
 
-impl<WRITER> IOWriterWriter<WRITER>
+impl<WRITER> WriterIoWriter<WRITER>
 where
     WRITER: AsyncWrite + Send + Unpin,
 {
-    /// Creates a new `IOWriterWriter` wrapping the given writer.
+    /// Creates a new `WriterIoWriter` wrapping the given writer.
     pub fn new(inner: WRITER) -> Self {
         Self {
             inner: RefCell::new(inner),
@@ -192,11 +193,11 @@ where
     }
 }
 
-impl<WRITER> IoWriter for IOWriterWriter<WRITER>
+impl<WRITER> IoWriter for WriterIoWriter<WRITER>
 where
     WRITER: AsyncWrite + Send + Unpin,
 {
-    type Error = std::io::Error;
+    type Error = IoError;
 
     fn prod_poll_write(
         &self,
@@ -209,7 +210,7 @@ where
         let mut inner = self.inner.borrow_mut();
         match Pin::new(&mut *inner).poll_write(cx, bytes.as_ref()) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Ready(Ok(sz)) => {
                 let _ = bytes.split_to(sz);
                 Poll::Ready(Ok(sz))
@@ -219,12 +220,12 @@ where
 
     fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
-        Pin::new(&mut *inner).poll_flush(cx)
+        Pin::new(&mut *inner).poll_flush(cx).map_err(Into::into)
     }
 
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
-        Pin::new(&mut *inner).poll_shutdown(cx)
+        Pin::new(&mut *inner).poll_shutdown(cx).map_err(Into::into)
     }
 }
 
@@ -609,7 +610,7 @@ mod tests {
         // Second read drains nothing more from the buffer, observes the
         // error from the second action, and surfaces it.
         match r.con_poll_read(&mut cx, 1024) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+            Poll::Ready(Err(e)) => assert_eq!(e, IoError::BrokenPipe),
             other => panic!("expected error, got {:?}", other.map(|_| ())),
         }
 
@@ -739,7 +740,7 @@ mod tests {
         let mut cx = Context::from_waker(&w);
 
         match r.con_poll_read(&mut cx, 1024) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::OutOfMemory),
+            Poll::Ready(Err(e)) => assert_eq!(e, IoError::OutOfMemory),
             other => panic!("expected OutOfMemory, got {:?}", other.map(|_| ())),
         }
     }
@@ -773,7 +774,7 @@ mod tests {
     }
 
     // =======================================================================
-    // IOWriterWriter tests
+    // WriterIoWriter tests
     // =======================================================================
 
     // -----------------------------------------------------------------------
@@ -782,7 +783,7 @@ mod tests {
 
     #[test]
     fn writer_empty_write_is_noop() {
-        let w = IOWriterWriter::new(MockWriter::new());
+        let w = WriterIoWriter::new(MockWriter::new());
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -801,7 +802,7 @@ mod tests {
     fn writer_writes_full_buffer() {
         let mw = MockWriter::new();
         let written = mw.written_handle();
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -822,7 +823,7 @@ mod tests {
     fn writer_partial_write_advances_payload() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Wrote(2)]);
         let written = mw.written_handle();
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -842,7 +843,7 @@ mod tests {
     #[test]
     fn writer_pending_leaves_payload_untouched() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Pending]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -862,13 +863,13 @@ mod tests {
     #[test]
     fn writer_propagates_error() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Err(io::ErrorKind::Other)]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         let mut payload = Bytes::from_static(b"q");
         match w.prod_poll_write(&mut cx, &mut payload) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::Other),
+            Poll::Ready(Err(e)) => assert_eq!(e, IoError::Unknown),
             other => panic!("expected Other error, got {:?}", other.map(|_| ())),
         }
         // Per the trait, on error the payload is not advanced.
@@ -886,14 +887,14 @@ mod tests {
             FlushAction::Ok,
             FlushAction::Err(io::ErrorKind::WriteZero),
         ]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         assert!(matches!(w.prod_poll_flush(&mut cx), Poll::Pending));
         assert!(matches!(w.prod_poll_flush(&mut cx), Poll::Ready(Ok(()))));
         match w.prod_poll_flush(&mut cx) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            Poll::Ready(Err(e)) => {},
             other => panic!("expected WriteZero, got {:?}", other.map(|_| ())),
         }
     }
@@ -906,7 +907,7 @@ mod tests {
     #[test]
     fn writer_close_pending_keeps_inner() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Pending]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -928,7 +929,7 @@ mod tests {
     #[test]
     fn writer_close_ok() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Ok]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -943,12 +944,12 @@ mod tests {
     fn writer_close_error_propagates() {
         let mw = MockWriter::new()
             .with_shutdowns(vec![ShutdownAction::Err(io::ErrorKind::ConnectionAborted)]);
-        let w = IOWriterWriter::new(mw);
+        let w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         match w.prod_poll_close(&mut cx) {
-            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted),
+            Poll::Ready(Err(e)) => assert_eq!(e, IoError::AbortRequested),
             other => panic!("expected ConnectionAborted, got {:?}", other.map(|_| ())),
         }
     }

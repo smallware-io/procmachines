@@ -227,6 +227,65 @@ impl From<IoError> for std::io::Error {
     }
 }
 
+#[cfg(feature = "std")]
+impl From<std::io::ErrorKind> for IoError {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::NotFound => IoError::NotFound,
+            std::io::ErrorKind::PermissionDenied => IoError::PermissionDenied,
+            std::io::ErrorKind::ConnectionRefused => IoError::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset => IoError::BrokenPipe,
+            std::io::ErrorKind::HostUnreachable => IoError::Unreachable,
+            std::io::ErrorKind::NetworkUnreachable => IoError::Unreachable,
+            std::io::ErrorKind::ConnectionAborted => IoError::AbortRequested,
+            std::io::ErrorKind::NotConnected => IoError::BrokenPipe,
+            std::io::ErrorKind::AddrInUse => IoError::AllocationConflict,
+            std::io::ErrorKind::AddrNotAvailable => IoError::AllocationConflict,
+            std::io::ErrorKind::NetworkDown => IoError::TemporarilyOffline,
+            std::io::ErrorKind::BrokenPipe => IoError::BrokenPipe,
+            std::io::ErrorKind::AlreadyExists => IoError::AlreadyExists,
+            std::io::ErrorKind::WouldBlock => IoError::Busy,
+            std::io::ErrorKind::NotADirectory => IoError::InvalidReference,
+            std::io::ErrorKind::IsADirectory => IoError::InvalidReference,
+            std::io::ErrorKind::DirectoryNotEmpty => IoError::OperationConflict,
+            std::io::ErrorKind::ReadOnlyFilesystem => IoError::Unsupported,
+            std::io::ErrorKind::StaleNetworkFileHandle => IoError::InvalidReference,
+            std::io::ErrorKind::InvalidInput => IoError::MalformedInput,
+            std::io::ErrorKind::InvalidData => IoError::InvalidData,
+            std::io::ErrorKind::TimedOut => IoError::TimedOut,
+            std::io::ErrorKind::WriteZero => IoError::BrokenPipe,
+            std::io::ErrorKind::StorageFull => IoError::OutOfStorage,
+            std::io::ErrorKind::NotSeekable => IoError::Unsupported,
+            std::io::ErrorKind::QuotaExceeded => IoError::QuotaLimited,
+            std::io::ErrorKind::FileTooLarge => IoError::TooBig,
+            std::io::ErrorKind::ResourceBusy => IoError::Busy,
+            std::io::ErrorKind::ExecutableFileBusy => IoError::Busy,
+            std::io::ErrorKind::Deadlock => IoError::Deadlock,
+            std::io::ErrorKind::CrossesDevices => IoError::Unsupported,
+            std::io::ErrorKind::TooManyLinks => IoError::Unknown,
+            std::io::ErrorKind::InvalidFilename => IoError::MalformedInput,
+            std::io::ErrorKind::ArgumentListTooLong => IoError::TooBig,
+            std::io::ErrorKind::Interrupted => IoError::Interrupted,
+            std::io::ErrorKind::Unsupported => IoError::Unsupported,
+            std::io::ErrorKind::UnexpectedEof => IoError::UnexpectedEof,
+            std::io::ErrorKind::OutOfMemory => IoError::OutOfMemory,
+            std::io::ErrorKind::Other => IoError::Unknown,
+            _ => IoError::Unknown,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<std::io::Error> for IoError {
+    fn from(err: std::io::Error) -> Self {
+        if let Some(inner) = err.get_ref().and_then(|e| e.downcast_ref::<IoError>()) {
+            *inner
+        } else {
+            IoError::from(err.kind())
+        }
+    }
+}
+
 impl IoError {
     /// The enum constant name for this variant.
     pub const fn as_str(self) -> &'static str {

@@ -23,7 +23,7 @@ use core::{
 };
 use parking_lot::Mutex;
 
-use crate::io_exchange::ExchangeWriteError;
+use crate::io_error::IoError;
 use bytes::Bytes;
 use futures::task::AtomicWaker;
 
@@ -253,7 +253,7 @@ impl IoReader for IoBytesExchange {
 // ---------------------------------------------------------------------------
 
 impl IoWriter for IoBytesExchange {
-    type Error = ExchangeWriteError;
+    type Error = IoError;
 
     /// Places data into the exchange slot.
     ///
@@ -264,7 +264,7 @@ impl IoWriter for IoBytesExchange {
         &self,
         cx: &mut Context<'_>,
         data: &mut Bytes,
-    ) -> Poll<Result<usize, ExchangeWriteError>> {
+    ) -> Poll<Result<usize, IoError>> {
         // Zero-byte writes are a no-op.  Per prod_poll* semantics: no
         // registration, no pre-wake.
         if data.is_empty() {
@@ -302,9 +302,9 @@ impl IoWriter for IoBytesExchange {
                 Poll::Pending
             }
             // Reader is gone.
-            EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
+            EXCH_DROPPED => Poll::Ready(Err(IoError::BrokenPipe)),
             // DONE or any unexpected value.
-            _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
+            _ => Poll::Ready(Err(IoError::InvalidState)),
         }
     }
 
@@ -316,7 +316,7 @@ impl IoWriter for IoBytesExchange {
     /// 2. The reader eventually observes the empty slot and transitions to
     ///    `EMPTY_FLUSHED`.
     /// 3. The writer sees `EMPTY_FLUSHED` and returns `Ready(Ok(()))`.
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         let st = self.state.load(Ordering::Acquire);
         match st {
             // A flush or close is already in progress — wait for the
@@ -372,7 +372,7 @@ impl IoWriter for IoBytesExchange {
     /// If the slot is empty the exchange moves directly to `DONE`.  If data
     /// is still in flight the state becomes `FULL_CLOSED`, allowing the
     /// reader to consume the last chunk before seeing end-of-stream.
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Any empty sub-state — go straight to DONE.
@@ -887,7 +887,7 @@ mod tests {
         // Subsequent write returns ReaderDropped.
         let mut more = Bytes::from_static(b"nope");
         match IoWriter::prod_poll_write(&ex, &mut wcx, &mut more) {
-            Poll::Ready(Err(ExchangeWriteError::ReaderDropped)) => {}
+            Poll::Ready(Err(IoError::BrokenPipe)) => {}
             other => panic!("expected ReaderDropped, got {:?}", other),
         }
     }
@@ -903,7 +903,7 @@ mod tests {
 
         let mut data = Bytes::from_static(b"x");
         match IoWriter::prod_poll_write(&ex, &mut wcx, &mut data) {
-            Poll::Ready(Err(ExchangeWriteError::ReaderDropped)) => {}
+            Poll::Ready(Err(IoError::BrokenPipe)) => {}
             other => panic!("expected ReaderDropped, got {:?}", other),
         }
     }

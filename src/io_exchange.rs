@@ -34,14 +34,13 @@
 //!   it can make progress.
 
 use core::{
-    fmt::Display,
     sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
 use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 
-use crate::{io_sink::IoSink, io_stream::IoStream};
+use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 
 /// A single-slot, lock-assisted rendezvous channel.
 ///
@@ -68,30 +67,6 @@ pub struct IoExchange<ITEM> {
     /// The single-item payload slot, protected by a mutex so that state
     /// transitions and payload swaps happen together.
     item: Mutex<Option<ITEM>>,
-}
-
-/// Errors returned by the writer side of an [`IoExchange`].
-#[derive(Debug)]
-pub enum ExchangeWriteError {
-    /// The reader called [`drop_read`](IoStream::drop_read), so no one will
-    /// ever consume further items.
-    ReaderDropped,
-    /// A state transition failed unexpectedly (e.g. concurrent send on a
-    /// single-producer channel).
-    InvalidState,
-}
-
-impl Display for ExchangeWriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ExchangeWriteError::ReaderDropped => {
-                write!(f, "Write operation failed -- the reader has been dropped.")
-            }
-            ExchangeWriteError::InvalidState => {
-                write!(f, "Write operation failed -- not ready to receive")
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +128,7 @@ impl<ITEM> IoExchange<ITEM> {
 
 impl<ITEM> IoStream for IoExchange<ITEM> {
     type Item = ITEM;
-    type Error = ();
+    type Error = IoError;
 
     /// Takes the next item from the exchange.
     ///
@@ -194,7 +169,7 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
             }
             // DROPPED
             _ => {
-                return Poll::Ready(Err(()));
+                return Poll::Ready(Err(IoError::InvalidState));
             }
         };
 
@@ -247,10 +222,10 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
 // ---------------------------------------------------------------------------
 
 impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
-    type Error = ExchangeWriteError;
+    type Error = IoError;
 
     /// Checks whether the slot is empty and ready to accept a new item.
-    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Any empty state means the slot is free.
@@ -263,8 +238,8 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
                 }
                 Poll::Pending
             }
-            EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
-            _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
+            EXCH_DROPPED => Poll::Ready(Err(IoError::BrokenPipe)),
+            _ => Poll::Ready(Err(IoError::InvalidState)),
         }
     }
 
@@ -277,7 +252,7 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
         &self,
         cx: &mut Context<'_>,
         item: &mut Option<ITEM>,
-    ) -> Poll<Result<(), ExchangeWriteError>> {
+    ) -> Poll<Result<(), IoError>> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
@@ -307,8 +282,8 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
                 }
                 Poll::Pending
             }
-            EXCH_DROPPED => Poll::Ready(Err(ExchangeWriteError::ReaderDropped)),
-            _ => Poll::Ready(Err(ExchangeWriteError::InvalidState)),
+            EXCH_DROPPED => Poll::Ready(Err(IoError::BrokenPipe)),
+            _ => Poll::Ready(Err(IoError::InvalidState)),
         }
     }
 
@@ -321,7 +296,7 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
     /// 3. Writer sees `EMPTY_FLUSHED` and returns `Ready`.
     ///
     /// The loop handles CAS retries if the state changes concurrently.
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Already in a flush/close state — wait for reader progress.
@@ -379,7 +354,7 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
     /// last item before seeing end-of-stream.
     ///
     /// The loop handles CAS retries.
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), ExchangeWriteError>> {
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         let st = self.state.load(Ordering::Acquire);
         match st {
             // Empty (any sub-state) — go straight to DONE.
@@ -566,15 +541,9 @@ mod tests {
         r.state.store(EXCH_DROPPED, AtomicOrdering::Release);
 
         let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
-        assert!(matches!(
-            ready,
-            Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
-        ));
+        assert!(matches!(ready, Poll::Ready(Err(IoError::BrokenPipe))));
         let ready = with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(1)));
-        assert!(matches!(
-            ready,
-            Poll::Ready(Err(ExchangeWriteError::ReaderDropped))
-        ));
+        assert!(matches!(ready, Poll::Ready(Err(IoError::BrokenPipe))));
     }
 
     // A minimal `Waker` that records how many times it was woken.

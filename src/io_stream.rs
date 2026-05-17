@@ -93,7 +93,7 @@ impl<STREAM: Stream + Unpin> StreamIoStream<STREAM> {
 
 impl<STREAM, ITEM, ERR> IoStream for StreamIoStream<STREAM>
 where
-    STREAM: Stream<Item = Result<ITEM, ERR>> + Unpin
+    STREAM: Stream<Item = Result<ITEM, ERR>> + Unpin,
 {
     type Item = ITEM;
     type Error = ERR;

@@ -21,7 +21,7 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
-use parking_lot::Mutex;
+use lock_api::{Mutex, RawMutex};
 
 use crate::io_error::IoError;
 use bytes::Bytes;
@@ -50,7 +50,7 @@ use crate::{io_reader::IoReader, io_writer::IoWriter};
 ///  any    ─drop_read─▶ DROPPED   (reader gives up)
 /// ```
 #[derive(Debug)]
-pub struct IoBytesExchange {
+pub struct IoBytesExchange<R: RawMutex> {
     /// Waker for the reader side, notified when an item is placed or the
     /// stream is closed.
     reader: AtomicWaker,
@@ -60,7 +60,7 @@ pub struct IoBytesExchange {
     /// Atomic state machine governing the exchange lifecycle.
     state: AtomicU8,
     /// Stored payload
-    data: Mutex<Bytes>,
+    data: Mutex<R, Bytes>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,13 +102,13 @@ const EXCH_DONE: u8 = 6;
 /// [`ExchangeWriteError::ReaderDropped`].
 const EXCH_DROPPED: u8 = 7;
 
-impl Default for IoBytesExchange {
+impl<R: RawMutex> Default for IoBytesExchange<R> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl IoBytesExchange {
+impl<R: RawMutex> IoBytesExchange<R> {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
         Self {
@@ -136,7 +136,7 @@ impl IoBytesExchange {
 // IoReader (consumer / reader side)
 // ---------------------------------------------------------------------------
 
-impl IoReader for IoBytesExchange {
+impl<R: RawMutex + Send> IoReader for IoBytesExchange<R> {
     type Error = IoError;
 
     fn con_poll_read(
@@ -252,7 +252,7 @@ impl IoReader for IoBytesExchange {
 // IoWriter (producer / writer side)
 // ---------------------------------------------------------------------------
 
-impl IoWriter for IoBytesExchange {
+impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
     type Error = IoError;
 
     /// Places data into the exchange slot.
@@ -428,6 +428,7 @@ impl IoWriter for IoBytesExchange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RawMutex;
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake};
 
@@ -479,7 +480,7 @@ mod tests {
 
     #[test]
     fn new_exchange_starts_empty() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
         assert!(ex.data.lock().is_empty());
     }
@@ -490,7 +491,7 @@ mod tests {
 
     #[test]
     fn write_then_read() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -518,7 +519,7 @@ mod tests {
 
     #[test]
     fn write_empty_bytes_is_noop() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -533,7 +534,7 @@ mod tests {
 
     #[test]
     fn read_zero_on_empty_returns_pending() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
@@ -547,7 +548,7 @@ mod tests {
 
     #[test]
     fn read_zero_on_full_returns_some_empty() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (rw, rwaker) = make_waker();
@@ -575,7 +576,7 @@ mod tests {
 
     #[test]
     fn partial_read_splits_data() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (rw, rwaker) = make_waker();
@@ -612,7 +613,7 @@ mod tests {
 
     #[test]
     fn write_when_full_returns_pending() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -633,7 +634,7 @@ mod tests {
 
     #[test]
     fn read_on_empty_returns_pending() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
@@ -649,7 +650,7 @@ mod tests {
 
     #[test]
     fn writer_is_woken_after_read_frees_slot() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (ww, wwaker) = make_waker();
         let mut wcx = Context::from_waker(&wwaker);
         let (_, rw) = make_waker();
@@ -674,7 +675,7 @@ mod tests {
 
     #[test]
     fn reader_is_woken_after_write_fills_slot() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
@@ -700,7 +701,7 @@ mod tests {
 
     #[test]
     fn flush_on_empty_completes_after_reader_ack() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -729,7 +730,7 @@ mod tests {
 
     #[test]
     fn flush_on_full_completes_after_read_and_ack() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -767,7 +768,7 @@ mod tests {
 
     #[test]
     fn flush_already_flushed_returns_ready() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -790,7 +791,7 @@ mod tests {
 
     #[test]
     fn close_on_empty_goes_to_done() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -811,7 +812,7 @@ mod tests {
 
     #[test]
     fn close_on_full_delivers_last_item_then_eof() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -842,7 +843,7 @@ mod tests {
 
     #[test]
     fn close_is_idempotent() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -862,7 +863,7 @@ mod tests {
 
     #[test]
     fn drop_read_signals_writer() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (ww, wwaker) = make_waker();
         let mut wcx = Context::from_waker(&wwaker);
 
@@ -894,7 +895,7 @@ mod tests {
 
     #[test]
     fn drop_read_on_empty() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -910,7 +911,7 @@ mod tests {
 
     #[test]
     fn drop_read_is_idempotent() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         IoReader::drop_read(&ex);
         IoReader::drop_read(&ex); // should not panic
         assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
@@ -918,7 +919,7 @@ mod tests {
 
     #[test]
     fn drop_read_after_done_is_noop() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
@@ -935,7 +936,7 @@ mod tests {
 
     #[test]
     fn read_after_done_returns_none() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -953,7 +954,7 @@ mod tests {
 
     #[test]
     fn read_after_dropped_returns_none() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
@@ -971,7 +972,7 @@ mod tests {
 
     #[test]
     fn write_after_done_returns_error() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -990,7 +991,7 @@ mod tests {
 
     #[test]
     fn flush_after_done_returns_ok() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -1004,7 +1005,7 @@ mod tests {
 
     #[test]
     fn flush_after_dropped_returns_ok() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -1018,7 +1019,7 @@ mod tests {
 
     #[test]
     fn close_after_dropped_returns_ok() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -1036,7 +1037,7 @@ mod tests {
 
     #[test]
     fn close_on_full_flush_transitions_to_full_closed() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1069,7 +1070,7 @@ mod tests {
 
     #[test]
     fn multiple_write_read_cycles() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1096,7 +1097,7 @@ mod tests {
 
     #[test]
     fn partial_reads_drain_slot_correctly() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1132,7 +1133,7 @@ mod tests {
 
     #[test]
     fn partial_read_with_close_defers_done() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1170,7 +1171,7 @@ mod tests {
 
     #[test]
     fn eof_with_max_len_gt_zero_wakes_reader() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
@@ -1193,7 +1194,7 @@ mod tests {
 
     #[test]
     fn eof_with_max_len_zero_pre_wakes_reader() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
@@ -1221,7 +1222,7 @@ mod tests {
 
     #[test]
     fn close_on_empty_flush_goes_to_done() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -1239,7 +1240,7 @@ mod tests {
 
     #[test]
     fn close_on_empty_flushed_goes_to_done() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1263,7 +1264,7 @@ mod tests {
 
     #[test]
     fn drop_read_during_flush() {
-        let ex = IoBytesExchange::new();
+        let ex = IoBytesExchange::<RawMutex>::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
@@ -1288,7 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_write_read_roundtrip() {
-        let ex = Arc::new(IoBytesExchange::new());
+        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
 
         let writer_ex = ex.clone();
         let writer = tokio::spawn(async move {
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_multiple_chunks() {
-        let ex = Arc::new(IoBytesExchange::new());
+        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
         let chunks: Vec<&[u8]> = vec![b"one", b"two", b"three"];
 
         let writer_ex = ex.clone();
@@ -1372,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_flush_handshake() {
-        let ex = Arc::new(IoBytesExchange::new());
+        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
 
         let writer_ex = ex.clone();
         let writer = tokio::spawn(async move {

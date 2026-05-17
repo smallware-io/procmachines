@@ -38,7 +38,7 @@ use core::{
     task::{Context, Poll},
 };
 use futures::task::AtomicWaker;
-use parking_lot::Mutex;
+use lock_api::{Mutex, RawMutex};
 
 use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 
@@ -55,7 +55,7 @@ use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 /// [`IoSink`] / [`IoStream`] methods to send and receive items, while
 /// external code interacts through the [`IoGuard`](crate::IoGuard).
 #[derive(Debug)]
-pub struct IoExchange<ITEM> {
+pub struct IoExchange<R: RawMutex, ITEM> {
     /// Waker for the reader side, notified when an item is placed or the
     /// stream is closed.
     reader: AtomicWaker,
@@ -66,7 +66,7 @@ pub struct IoExchange<ITEM> {
     state: AtomicU8,
     /// The single-item payload slot, protected by a mutex so that state
     /// transitions and payload swaps happen together.
-    item: Mutex<Option<ITEM>>,
+    item: Mutex<R, Option<ITEM>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,13 +92,13 @@ const EXCH_DONE: u8 = 6;
 /// The reader has been dropped; further writes will error.
 const EXCH_DROPPED: u8 = 7;
 
-impl<ITEM> Default for IoExchange<ITEM> {
+impl<R: RawMutex, ITEM> Default for IoExchange<R, ITEM> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<ITEM> IoExchange<ITEM> {
+impl<R: RawMutex, ITEM> IoExchange<R, ITEM> {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
         Self {
@@ -126,7 +126,7 @@ impl<ITEM> IoExchange<ITEM> {
 // IoStream (reader side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM> IoStream for IoExchange<ITEM> {
+impl<R: RawMutex, ITEM> IoStream for IoExchange<R, ITEM> {
     type Item = ITEM;
     type Error = IoError;
 
@@ -221,7 +221,7 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
 // IoSink (writer side)
 // ---------------------------------------------------------------------------
 
-impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
+impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
     type Error = IoError;
 
     /// Checks whether the slot is empty and ready to accept a new item.
@@ -408,8 +408,11 @@ impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
 mod tests {
     use super::*;
     use futures::task::noop_waker;
+    use parking_lot::RawMutex;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::task::Context;
+
+    type TestExchange = IoExchange<RawMutex, u64>;
 
     /// Helper: run a closure with a no-op waker context.
     fn with_noop_cx<T>(f: impl FnOnce(&mut Context<'_>) -> T) -> T {
@@ -420,7 +423,7 @@ mod tests {
 
     #[test]
     fn send_receive_single_item() {
-        let r = IoExchange::new();
+        let r = TestExchange::new();
 
         let pending = with_noop_cx(|cx| r.con_poll_read(cx));
         assert!(matches!(pending, Poll::Pending));
@@ -448,7 +451,7 @@ mod tests {
 
     #[test]
     fn flush_on_empty_requires_check() {
-        let r: IoExchange<i32> = IoExchange::new();
+        let r = TestExchange::new();
 
         let flushed = with_noop_cx(|cx| r.prod_poll_flush(cx));
         assert!(matches!(flushed, Poll::Pending));
@@ -468,7 +471,7 @@ mod tests {
 
     #[test]
     fn flush_waits_for_in_flight_item_and_check() {
-        let r = IoExchange::new();
+        let r = TestExchange::new();
         match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(7))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
@@ -492,7 +495,7 @@ mod tests {
 
     #[test]
     fn close_when_empty_finishes_stream() {
-        let r: IoExchange<i32> = IoExchange::new();
+        let r = TestExchange::new();
 
         let closed = with_noop_cx(|cx| r.prod_poll_close(cx));
         assert!(matches!(closed, Poll::Ready(Ok(()))));
@@ -503,7 +506,7 @@ mod tests {
 
     #[test]
     fn close_after_full_delivers_last_item() {
-        let r = IoExchange::new();
+        let r = TestExchange::new();
         match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(11))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
@@ -524,7 +527,7 @@ mod tests {
 
     #[test]
     fn start_send_on_full_is_invalid_state() {
-        let r: IoExchange<i32> = IoExchange::new();
+        let r = TestExchange::new();
         match with_noop_cx(|cx| r.prod_poll_send(cx, &mut Some(1))) {
             Poll::Ready(Ok(_)) => (),
             _ => panic!(),
@@ -537,7 +540,7 @@ mod tests {
 
     #[test]
     fn reader_dropped_errors() {
-        let r = IoExchange::<i32>::new();
+        let r = TestExchange::new();
         r.state.store(EXCH_DROPPED, AtomicOrdering::Release);
 
         let ready = with_noop_cx(|cx| r.prod_poll_ready(cx));
@@ -572,7 +575,7 @@ mod tests {
     fn con_poll_read_pre_wakes_on_consume_and_eof() {
         // Pre-wake when an item is consumed, and again when EOS is
         // consumed (each EOS return counts as consumption).
-        let r = IoExchange::new();
+        let r = TestExchange::new();
         let cw = CountWaker::new();
         let w: std::task::Waker = cw.clone().into();
         let mut cx = Context::from_waker(&w);

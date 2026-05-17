@@ -36,7 +36,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use parking_lot::Mutex;
+use lock_api::{Mutex, RawMutex};
 
 // ---------------------------------------------------------------------------
 // ClockNodeValue — IntrusiveNodeValue implementation for AlarmClock / ClockAlarm
@@ -45,31 +45,31 @@ use parking_lot::Mutex;
 /// The [`IntrusiveNodeValue`] implementation used by [`AlarmClock`] and
 /// [`ClockAlarm`].
 ///
-/// Head nodes hold a `Mutex<T>` protecting the current clock value.
+/// Head nodes hold a `Mutex<R,T>` protecting the current clock value.
 /// Leaf nodes store an alarm threshold (`Option<T>`), a [`Waker`], and a raw
 /// pointer back to the head node.  `None` disables the alarm; comparisons
 /// use `PartialOrd`.
-enum ClockNodeValue<T> {
+enum ClockNodeValue<R: RawMutex, T> {
     /// The sentinel head node.  Owns the mutex that protects the clock value
     /// and synchronises all list mutations.
-    Head { mutex: Mutex<T> },
+    Head { mutex: Mutex<R, T> },
     /// A leaf (alarm) node.  Stores the alarm threshold in `val`, a waker to
     /// notify when the alarm fires, and a raw pointer back to the head node
     /// so it can acquire the mutex.
     Node {
         // SAFETY: The `ClockAlarm` constructor ensures that the target (head)
         // is pinned and outlives this node via the `'a` lifetime parameter.
-        target: *const IntrusiveListNode<ClockNodeValue<T>>,
+        target: *const IntrusiveListNode<ClockNodeValue<R, T>>,
         val: UnsafeCell<Option<T>>,
         waker: UnsafeCell<Option<Waker>>,
     },
 }
 
-impl<T> ClockNodeValue<T> {
+impl<R: RawMutex, T> ClockNodeValue<R, T> {
     /// Creates a head-node value with the given initial clock value.
     fn new_head(val: T) -> Self {
         ClockNodeValue::Head {
-            mutex: Mutex::new(val),
+            mutex: Mutex::<R, T>::new(val),
         }
     }
 
@@ -160,10 +160,11 @@ impl<T> ClockNodeValue<T> {
     }
 }
 
-impl<T> IntrusiveNodeValue for ClockNodeValue<T> {
+impl<R: RawMutex, T> IntrusiveNodeValue for ClockNodeValue<R, T> {
     type HeadValue = T;
+    type RawMutex = R;
 
-    fn lock_list(&self) -> parking_lot::MutexGuard<'_, T> {
+    fn lock_list(&self) -> lock_api::MutexGuard<'_, R, T> {
         match self {
             ClockNodeValue::Head { mutex } => mutex.lock(),
             ClockNodeValue::Node { .. } => panic!("lock_list called on leaf node"),
@@ -212,11 +213,11 @@ impl<T> IntrusiveNodeValue for ClockNodeValue<T> {
 /// clock.set(10);
 /// // `alarm` will resolve on next poll.
 /// ```
-pub struct AlarmClock<T> {
-    head: IntrusiveListNode<ClockNodeValue<T>>,
+pub struct AlarmClock<R: RawMutex, T> {
+    head: IntrusiveListNode<ClockNodeValue<R, T>>,
 }
 
-impl<T: PartialOrd + Clone> AlarmClock<T> {
+impl<R: RawMutex, T: PartialOrd + Clone> AlarmClock<R, T> {
     /// Creates a new alarm clock with the given initial clock value.
     pub fn new(val: T) -> Self {
         Self {
@@ -282,8 +283,8 @@ impl<T: PartialOrd + Clone> AlarmClock<T> {
     }
 }
 
-impl<T: Debug> Debug for AlarmClock<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<R: RawMutex, T: Debug> Debug for AlarmClock<R, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let g = self.head.lock_head();
         f.debug_struct("AlarmClock").field("val", &*g).finish()
     }
@@ -325,22 +326,22 @@ impl<T: Debug> Debug for AlarmClock<T> {
 ///
 /// The `'a` lifetime ties this alarm to its parent clock, ensuring the clock
 /// is not dropped while alarms reference it.
-pub struct ClockAlarm<'a, T> {
-    node: IntrusiveListNode<ClockNodeValue<T>>,
-    _lifetime: PhantomData<&'a AlarmClock<T>>,
+pub struct ClockAlarm<'a, R: RawMutex, T> {
+    node: IntrusiveListNode<ClockNodeValue<R, T>>,
+    _lifetime: PhantomData<&'a AlarmClock<R, T>>,
 }
 
-impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
+impl<'a, R: RawMutex, T: PartialOrd> ClockAlarm<'a, R, T> {
     /// Creates a new alarm against the given pinned clock.
     ///
     /// `wake_at` is the threshold value; the alarm fires when the clock reaches
     /// or exceeds it.  Pass `None` to create a disabled alarm that can be armed
     /// later via [`set_alarm`](Self::set_alarm).
-    pub fn new(clock: Pin<&'a AlarmClock<T>>, wake_at: Option<T>) -> Self {
+    pub fn new(clock: Pin<&'a AlarmClock<R, T>>, wake_at: Option<T>) -> Self {
         let head_ref = unsafe { Pin::into_inner_unchecked(clock) };
         Self {
             node: IntrusiveListNode::new(ClockNodeValue::new_node(
-                &head_ref.head as *const IntrusiveListNode<ClockNodeValue<T>>,
+                &head_ref.head as *const IntrusiveListNode<ClockNodeValue<R, T>>,
                 wake_at,
             )),
             _lifetime: PhantomData,
@@ -421,7 +422,7 @@ impl<'a, T: PartialOrd> ClockAlarm<'a, T> {
     }
 }
 
-impl<'a, T: PartialOrd> Future for ClockAlarm<'a, T> {
+impl<'a, R: RawMutex, T: PartialOrd> Future for ClockAlarm<'a, R, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
@@ -432,6 +433,7 @@ impl<'a, T: PartialOrd> Future for ClockAlarm<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RawMutex;
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -464,7 +466,7 @@ mod tests {
 
     /// Helper: poll a ClockAlarm and return the Poll result.
     fn poll_alarm<T: PartialOrd + Clone>(
-        alarm: &mut Pin<&mut ClockAlarm<'_, T>>,
+        alarm: &mut Pin<&mut ClockAlarm<'_, RawMutex, T>>,
         waker: &Waker,
     ) -> Poll<()> {
         let mut cx = Context::from_waker(waker);
@@ -473,14 +475,16 @@ mod tests {
 
     /// Helper: call AlarmClock::set through a Pin<&mut AlarmClock> without
     /// accidentally hitting Pin::set (which expects a whole AlarmClock value).
-    fn clock_set(clock: &Pin<&mut AlarmClock<u64>>, val: u64) {
+    fn clock_set(clock: &Pin<&mut AlarmClock<RawMutex, u64>>, val: u64) {
         clock.as_ref().get_ref().set(val);
     }
 
     /// Helper: call ClockAlarm::set_alarm through a Pin<&mut ClockAlarm>.
-    fn alarm_set(alarm: &Pin<&mut ClockAlarm<'_, u64>>, val: Option<u64>) {
+    fn alarm_set(alarm: &Pin<&mut ClockAlarm<'_, RawMutex, u64>>, val: Option<u64>) {
         alarm.as_ref().get_ref().set_alarm(val);
     }
+
+    type TestClock = AlarmClock<RawMutex, u64>;
 
     // -----------------------------------------------------------------------
     // AlarmClock basic tests
@@ -488,13 +492,13 @@ mod tests {
 
     #[test]
     fn alarm_clock_new_and_get() {
-        let clock = AlarmClock::new(42u64);
+        let clock = TestClock::new(42u64);
         assert_eq!(clock.get(), 42);
     }
 
     #[test]
     fn alarm_clock_set() {
-        let clock = AlarmClock::new(0u64);
+        let clock = TestClock::new(0u64);
         clock.set(100);
         assert_eq!(clock.get(), 100);
         // set allows going backwards
@@ -504,7 +508,7 @@ mod tests {
 
     #[test]
     fn alarm_clock_advance_only_forward() {
-        let clock = AlarmClock::new(10u64);
+        let clock = TestClock::new(10u64);
         // Advance to a larger value succeeds
         assert!(clock.advance(20));
         assert_eq!(clock.get(), 20);
@@ -518,7 +522,7 @@ mod tests {
 
     #[test]
     fn alarm_clock_debug() {
-        let clock = AlarmClock::new(99u64);
+        let clock = TestClock::new(99u64);
         let dbg = format!("{:?}", clock);
         assert!(dbg.contains("AlarmClock"));
         assert!(dbg.contains("99"));
@@ -530,21 +534,21 @@ mod tests {
 
     #[test]
     fn clock_alarm_new_and_get() {
-        let clock = pin!(AlarmClock::new(0u64));
+        let clock = pin!(TestClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
         assert_eq!(alarm.get_alarm(), Some(&10));
     }
 
     #[test]
     fn clock_alarm_new_none_threshold() {
-        let clock = pin!(AlarmClock::new(0u64));
+        let clock = pin!(TestClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), None);
         assert_eq!(alarm.get_alarm(), None);
     }
 
     #[test]
     fn clock_alarm_set_threshold() {
-        let clock = pin!(AlarmClock::new(0u64));
+        let clock = pin!(TestClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
         alarm.set_alarm(Some(20));
         assert_eq!(alarm.get_alarm(), Some(&20));
@@ -558,7 +562,7 @@ mod tests {
 
     #[test]
     fn poll_pending_when_clock_below_threshold() {
-        let clock = pin!(AlarmClock::new(0u64));
+        let clock = pin!(TestClock::new(0u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
         let mut alarm = pin!(alarm);
         let tw = TestWaker::new();
@@ -569,7 +573,7 @@ mod tests {
 
     #[test]
     fn poll_ready_when_clock_at_threshold() {
-        let clock = pin!(AlarmClock::new(10u64));
+        let clock = pin!(TestClock::new(10u64));
         let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
         let mut alarm = pin!(alarm);
         let tw = TestWaker::new();
@@ -941,10 +945,10 @@ mod tests {
 
         // Convert to usize to make it Send; SAFETY: clock outlives the spawned task
         // and AlarmClock is Sync (via IntrusiveListNode's unsafe impl).
-        let addr = clock_ref.get_ref() as *const AlarmClock<u64> as usize;
+        let addr = clock_ref.get_ref() as *const TestClock as usize;
         let handle = tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            unsafe { &*(addr as *const AlarmClock<u64>) }.set(10);
+            unsafe { &*(addr as *const TestClock) }.set(10);
         });
 
         alarm.as_mut().await;
@@ -959,10 +963,10 @@ mod tests {
         let mut a1 = pin!(ClockAlarm::new(clock_ref, Some(5)));
         let mut a2 = pin!(ClockAlarm::new(clock_ref, Some(10)));
 
-        let addr = clock_ref.get_ref() as *const AlarmClock<u64> as usize;
+        let addr = clock_ref.get_ref() as *const TestClock as usize;
         tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
-            let clock = unsafe { &*(addr as *const AlarmClock<u64>) };
+            let clock = unsafe { &*(addr as *const TestClock) };
             clock.set(5);
             std::thread::sleep(std::time::Duration::from_millis(30));
             clock.set(10);

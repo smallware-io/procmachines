@@ -24,6 +24,8 @@
 
 use core::{cell::UnsafeCell, marker::PhantomPinned};
 
+use lock_api::{MutexGuard, RawMutex};
+
 // ---------------------------------------------------------------------------
 // IntrusiveNodeValue — trait for the node-type discriminant
 // ---------------------------------------------------------------------------
@@ -36,13 +38,14 @@ use core::{cell::UnsafeCell, marker::PhantomPinned};
 pub trait IntrusiveNodeValue: Sized {
     /// The value type stored in the head node mutex.
     type HeadValue;
+    type RawMutex: RawMutex;
 
     /// Locks the mutex on this head node.
     ///
     /// # Panics
     ///
     /// Panics if called on a leaf node.
-    fn lock_list(&self) -> parking_lot::MutexGuard<'_, Self::HeadValue>;
+    fn lock_list(&self) -> MutexGuard<'_, Self::RawMutex, Self::HeadValue>;
 
     /// Returns the head [`IntrusiveListNode`] that this leaf targets, or
     /// `None` if this is itself a head node.
@@ -127,7 +130,7 @@ impl<T> UnsafeLink<T> {
 /// [`MutexGuard`](parking_lot::MutexGuard) protecting the head's value.
 pub struct IntrusiveListGuard<'a, V: IntrusiveNodeValue> {
     head: &'a IntrusiveListNode<V>,
-    guard: parking_lot::MutexGuard<'a, V::HeadValue>,
+    guard: MutexGuard<'a, V::RawMutex, V::HeadValue>,
 }
 
 impl<V: IntrusiveNodeValue> core::ops::Deref for IntrusiveListGuard<'_, V> {
@@ -335,6 +338,7 @@ mod tests {
 
     impl IntrusiveNodeValue for TestNode {
         type HeadValue = i32;
+        type RawMutex = parking_lot::RawMutex;
 
         fn lock_list(&self) -> parking_lot::MutexGuard<'_, i32> {
             match self {

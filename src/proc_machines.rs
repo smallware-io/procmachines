@@ -83,7 +83,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 use futures::task::AtomicWaker;
-use parking_lot::{Mutex, lock_api::RawMutex as _};
+use lock_api::{Mutex, RawMutex};
 #[cfg(feature = "std")]
 use std::{sync::Arc, task::Wake};
 
@@ -406,11 +406,11 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
     ) -> impl ProcMachineJobs<IO>;
 
     /// Consumes the builder, allocates the ProcMachine, and returns it.
-    fn build(self, io: IO) -> Arc<dyn ProcMachine<IO>>
+    fn build<R: RawMutex + 'static>(self, io: IO) -> Arc<dyn ProcMachine<IO>>
     where
         Self: Sized + 'static,
     {
-        ProcMachineImpl::new(io, self)
+        ProcMachineImpl::<R, IO, Self::FUTURES>::new(io, self)
     }
 }
 
@@ -470,7 +470,7 @@ impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> 
 // ============================================================================
 //
 // ProcMachineInner holds the actual state: the IO struct, the futures, and
-// the alive_mask. It lives behind a parking_lot::Mutex inside an Arc.
+// the alive_mask. It lives behind a lock_api::Mutex inside an Arc.
 //
 // ProcMachineImpl is the Arc-allocated outer shell that also holds the
 // wake_mask (atomic, accessed outside the lock) and a raw self-pointer
@@ -553,27 +553,31 @@ pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
 /// `unsafe impl Send + Sync`. This is sound because `raw_arc` is
 /// immutable after construction and always points to the Arc's own
 /// allocation, which is guaranteed to be alive while any `&self` exists.
-struct ProcMachineImpl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> {
+struct ProcMachineImpl<
+    R: RawMutex,
+    IO: Send + Debug + ?Sized,
+    FUTURES: ProcMachineFutures + 'static,
+> {
     wake_mask: AtomicU32,
     external_waker: AtomicWaker,
     raw_arc: *const Self,
-    inner: Mutex<ProcMachineInner<IO, FUTURES>>,
+    inner: Mutex<R, ProcMachineInner<IO, FUTURES>>,
 }
 
 // SAFETY: All mutable state is behind the Mutex or is AtomicU32.
 // raw_arc is immutable after construction and points to the Arc's own
 // allocation (which is alive while any reference exists).
-unsafe impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Send
-    for ProcMachineImpl<IO, FUTURES>
+unsafe impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Send
+    for ProcMachineImpl<R, IO, FUTURES>
 {
 }
-unsafe impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Sync
-    for ProcMachineImpl<IO, FUTURES>
+unsafe impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Sync
+    for ProcMachineImpl<R, IO, FUTURES>
 {
 }
 
-impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::fmt::Debug
-    for ProcMachineImpl<IO, FUTURES>
+impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::fmt::Debug
+    for ProcMachineImpl<R, IO, FUTURES>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let guard = self.inner.lock();
@@ -590,8 +594,8 @@ impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::fmt::Debug
 /// the mutex is held (e.g. a task writes to an IoExchange, which wakes
 /// the reader's waker synchronously). Because `wake_mask` is atomic and
 /// lives outside the mutex, this never deadlocks.
-impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> MultiWake
-    for ProcMachineImpl<IO, FUTURES>
+impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> MultiWake
+    for ProcMachineImpl<R, IO, FUTURES>
 {
     fn wake(&self, n: u8) {
         loop {
@@ -617,8 +621,8 @@ impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> MultiWake
     }
 }
 
-impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
-    ProcMachineImpl<IO, FUTURES>
+impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
+    ProcMachineImpl<R, IO, FUTURES>
 {
     /// Allocates the ProcMachine, initialises futures, and performs the
     /// first tick.
@@ -663,8 +667,8 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
     }
 }
 
-impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachine<IO>
-    for ProcMachineImpl<IO, FUTURES>
+impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
+    ProcMachine<IO> for ProcMachineImpl<R, IO, FUTURES>
 {
     fn is_done(self: Pin<&Self>) -> bool {
         // Reconstruct a temporary Arc<Self> for tick(). The
@@ -832,6 +836,7 @@ fn get_multi_waker<T: MultiWake + 'static>(target: &Arc<T>, n: u8) -> Waker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RawMutex;
     use std::future::poll_fn;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -975,7 +980,7 @@ mod tests {
     fn build_single_task_machine() {
         let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
     }
 
     #[test]
@@ -983,14 +988,14 @@ mod tests {
         let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
     }
 
     #[test]
     fn immediate_task_runs_during_build() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         let guard = machine.lock();
         assert_eq!(guard.counter(), 1);
@@ -1001,7 +1006,7 @@ mod tests {
     fn immediate_task_is_done() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         assert!(machine.get_pin().is_done());
     }
@@ -1014,7 +1019,7 @@ mod tests {
     fn suspended_task_is_not_done() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         {
             let guard = machine.lock();
@@ -1028,7 +1033,7 @@ mod tests {
     fn wake_and_resume_single_task() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         // Open the gate and wake the task.
         {
@@ -1050,7 +1055,7 @@ mod tests {
     fn multiple_suspend_resume_cycles() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_multi_suspend)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         // Initial: first increment + suspend.
         {
@@ -1087,7 +1092,7 @@ mod tests {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
 
         // Both tasks ran their first half: 1 + 10 = 11.
         {
@@ -1125,7 +1130,7 @@ mod tests {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
 
         {
             let guard = machine.lock();
@@ -1148,7 +1153,7 @@ mod tests {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_wakes_other)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
 
         // Both ran their first half: 1 + 10 = 11.
         {
@@ -1180,7 +1185,7 @@ mod tests {
     fn guard_deref_provides_io_access() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         let guard = machine.lock();
         assert_eq!(guard.counter(), 1);
@@ -1190,7 +1195,7 @@ mod tests {
     fn guard_deref_mut_provides_mutable_access() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         {
             let guard = machine.lock();
@@ -1205,7 +1210,7 @@ mod tests {
     fn guard_drop_ticks_machine() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         {
             let guard = machine.lock();
@@ -1229,7 +1234,7 @@ mod tests {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
 
         assert!(!machine.get_pin().is_done());
 
@@ -1252,7 +1257,7 @@ mod tests {
     fn is_done_ticks_before_answering() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         {
             let guard = machine.lock();
@@ -1352,7 +1357,9 @@ mod tests {
 
     #[test]
     fn zero_work_task_completes_at_build() {
-        let machine = PROC_MACHINE_JOBS_BASE.with(task_noop).build(TestIO::new(0));
+        let machine = PROC_MACHINE_JOBS_BASE
+            .with(task_noop)
+            .build::<RawMutex>(TestIO::new(0));
 
         assert!(machine.get_pin().is_done());
         let guard = machine.lock();
@@ -1364,7 +1371,7 @@ mod tests {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
             .with(task_suspend_slot1)
-            .build(TestIO::new(2));
+            .build::<RawMutex>(TestIO::new(2));
 
         {
             let guard = machine.lock();
@@ -1389,7 +1396,7 @@ mod tests {
     fn repeated_lock_unlock_without_wakes() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         for _ in 0..10 {
             let guard = machine.lock();
@@ -1402,7 +1409,7 @@ mod tests {
     fn debug_format_shows_io_and_alive_mask() {
         let machine = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
-            .build(TestIO::new(1));
+            .build::<RawMutex>(TestIO::new(1));
 
         let dbg = format!("{:?}", machine);
         assert!(dbg.contains("ProcMachineImpl"));

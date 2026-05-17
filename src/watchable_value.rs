@@ -35,7 +35,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
-use parking_lot::Mutex;
+use lock_api::{Mutex, MutexGuard, RawMutex};
 
 // ---------------------------------------------------------------------------
 // WatchNodeValue — IntrusiveNodeValue implementation
@@ -49,17 +49,17 @@ use parking_lot::Mutex;
 /// value changes, all linked leaves are unlinked and woken.  Readiness is
 /// determined by link state: an unlinked leaf is ready, a linked leaf is
 /// pending.
-enum WatchNodeValue<T: Clone> {
+enum WatchNodeValue<R: RawMutex, T: Clone> {
     Head {
-        mutex: Mutex<T>,
+        mutex: Mutex<R, T>,
     },
     Node {
-        target: *const IntrusiveListNode<WatchNodeValue<T>>,
+        target: *const IntrusiveListNode<WatchNodeValue<R, T>>,
         waker: UnsafeCell<Option<Waker>>,
     },
 }
 
-impl<T: Clone> WatchNodeValue<T> {
+impl<R: RawMutex, T: Clone> WatchNodeValue<R, T> {
     fn new_head(val: T) -> Self {
         WatchNodeValue::Head {
             mutex: Mutex::new(val),
@@ -110,10 +110,11 @@ impl<T: Clone> WatchNodeValue<T> {
     }
 }
 
-impl<T: Clone> IntrusiveNodeValue for WatchNodeValue<T> {
+impl<R: RawMutex, T: Clone> IntrusiveNodeValue for WatchNodeValue<R, T> {
     type HeadValue = T;
+    type RawMutex = R;
 
-    fn lock_list(&self) -> parking_lot::MutexGuard<'_, T> {
+    fn lock_list(&self) -> MutexGuard<'_, R, T> {
         match self {
             WatchNodeValue::Head { mutex } => mutex.lock(),
             WatchNodeValue::Node { .. } => panic!("lock_list called on leaf node"),
@@ -143,11 +144,11 @@ impl<T: Clone> IntrusiveNodeValue for WatchNodeValue<T> {
 ///
 /// A `WatchableValue` must be pinned before any [`ValueWatch`] can be created
 /// against it, because watchers store raw pointers back to the internal node.
-pub struct WatchableValue<T: Clone> {
-    head: IntrusiveListNode<WatchNodeValue<T>>,
+pub struct WatchableValue<R: RawMutex, T: Clone> {
+    head: IntrusiveListNode<WatchNodeValue<R, T>>,
 }
 
-impl<T: Clone> WatchableValue<T> {
+impl<R: RawMutex, T: Clone> WatchableValue<R, T> {
     /// Creates a new watchable value with the given initial value.
     pub fn new(val: T) -> Self {
         Self {
@@ -180,7 +181,7 @@ impl<T: Clone> WatchableValue<T> {
     }
 }
 
-impl<T: Clone + Debug> Debug for WatchableValue<T> {
+impl<R: RawMutex, T: Clone + Debug> Debug for WatchableValue<R, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let g = self.head.lock_head();
         f.debug_struct("WatchableValue")
@@ -216,18 +217,18 @@ impl<T: Clone + Debug> Debug for WatchableValue<T> {
 ///
 /// The `'a` lifetime ties this watch to its parent value, ensuring the value
 /// is not dropped while watches reference it.
-pub struct ValueWatch<'a, T: Clone> {
-    node: IntrusiveListNode<WatchNodeValue<T>>,
-    _lifetime: PhantomData<&'a WatchableValue<T>>,
+pub struct ValueWatch<'a, R: RawMutex, T: Clone> {
+    node: IntrusiveListNode<WatchNodeValue<R, T>>,
+    _lifetime: PhantomData<&'a WatchableValue<R, T>>,
 }
 
-impl<'a, T: Clone> ValueWatch<'a, T> {
+impl<'a, R: RawMutex, T: Clone> ValueWatch<'a, R, T> {
     /// Creates a new watch against the given pinned watchable value.
-    pub fn new(value: Pin<&'a WatchableValue<T>>) -> Self {
+    pub fn new(value: Pin<&'a WatchableValue<R, T>>) -> Self {
         let head_ref = unsafe { Pin::into_inner_unchecked(value) };
         Self {
             node: IntrusiveListNode::new(WatchNodeValue::new_node(
-                &head_ref.head as *const IntrusiveListNode<WatchNodeValue<T>>,
+                &head_ref.head as *const IntrusiveListNode<WatchNodeValue<R, T>>,
             )),
             _lifetime: PhantomData,
         }
@@ -288,7 +289,7 @@ impl<'a, T: Clone> ValueWatch<'a, T> {
     }
 }
 
-impl<'a, T: Clone> Future for ValueWatch<'a, T> {
+impl<'a, R: RawMutex, T: Clone> Future for ValueWatch<'a, R, T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
@@ -299,6 +300,7 @@ impl<'a, T: Clone> Future for ValueWatch<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RawMutex;
     use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,10 +328,15 @@ mod tests {
         }
     }
 
-    fn poll_watch<T: Clone>(watch: &mut Pin<&mut ValueWatch<'_, T>>, waker: &Waker) -> Poll<T> {
+    fn poll_watch<T: Clone>(
+        watch: &mut Pin<&mut ValueWatch<'_, RawMutex, T>>,
+        waker: &Waker,
+    ) -> Poll<T> {
         let mut cx = Context::from_waker(waker);
         watch.as_mut().poll(&mut cx)
     }
+
+    type TestWatchable = WatchableValue<RawMutex, u64>;
 
     // -----------------------------------------------------------------------
     // Basic tests
@@ -337,20 +344,20 @@ mod tests {
 
     #[test]
     fn watchable_value_new_and_get() {
-        let wv = WatchableValue::new(42u64);
+        let wv = TestWatchable::new(42u64);
         assert_eq!(wv.get(), 42);
     }
 
     #[test]
     fn watchable_value_set_and_get() {
-        let wv = WatchableValue::new(0u64);
+        let wv = TestWatchable::new(0u64);
         wv.set(100);
         assert_eq!(wv.get(), 100);
     }
 
     #[test]
     fn watchable_value_debug() {
-        let wv = WatchableValue::new(99u64);
+        let wv = TestWatchable::new(99u64);
         let dbg = format!("{:?}", wv);
         assert!(dbg.contains("WatchableValue"));
         assert!(dbg.contains("99"));
@@ -552,7 +559,7 @@ mod tests {
 
     #[test]
     fn drop_watch_before_polling() {
-        let wv = pin!(WatchableValue::new(0u64));
+        let wv = pin!(TestWatchable::new(0u64));
         {
             let _watch = ValueWatch::new(wv.as_ref());
         }
@@ -613,7 +620,7 @@ mod tests {
 
     #[test]
     fn watch_poll_returns_ready_then_ready() {
-        let wv = pin!(WatchableValue::new(0u64));
+        let wv = pin!(TestWatchable::new(0u64));
         let watch = ValueWatch::new(wv.as_ref());
         let mut watch = pin!(watch);
         let tw = TestWaker::new();
@@ -639,10 +646,10 @@ mod tests {
         let val = watch.as_mut().await;
         assert_eq!(val, 0);
 
-        let addr = wv_ref.get_ref() as *const WatchableValue<u64> as usize;
+        let addr = wv_ref.get_ref() as *const TestWatchable as usize;
         let handle = tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            unsafe { &*(addr as *const WatchableValue<u64>) }.set(42);
+            unsafe { &*(addr as *const TestWatchable) }.set(42);
         });
 
         let val = watch.as_mut().await;

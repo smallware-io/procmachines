@@ -137,7 +137,7 @@ impl IoBytesExchange {
 // ---------------------------------------------------------------------------
 
 impl IoReader for IoBytesExchange {
-    type Error = core::convert::Infallible;
+    type Error = IoError;
 
     fn con_poll_read(
         &self,

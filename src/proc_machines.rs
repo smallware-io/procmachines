@@ -98,7 +98,7 @@ use std::{sync::Arc, task::Wake};
 /// advance automatically when the lock is released.
 ///
 /// Callers work with `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachine<IO>: core::fmt::Debug + Send + Sync {
+pub trait ProcMachine<IO: ?Sized>: core::fmt::Debug + Send + Sync {
     /// Returns `true` when every internal task has completed.
     ///
     /// Also ticks the machine, so any pending wakes are processed first.
@@ -144,12 +144,12 @@ pub trait ProcMachine<IO>: core::fmt::Debug + Send + Sync {
     unsafe fn unsafe_unlock_io(self: Pin<&Self>);
 }
 
-pub trait IoGuard<'a, IO>: Deref<Target = IO> + DerefMut<Target = IO> {
+pub trait IoGuard<'a, IO: ?Sized>: Deref<Target = IO> + DerefMut<Target = IO> {
     fn get_pin(&'a self) -> Pin<&'a IO>;
 }
 
 /// Extension trait on `Arc<dyn ProcMachine<IO>>` providing safe lock access.
-pub trait ProcMachineHolder<IO> {
+pub trait ProcMachineHolder<IO: ?Sized> {
     type Guard<'a>: IoGuard<'a, IO>
     where
         Self: 'a;
@@ -161,7 +161,7 @@ pub trait ProcMachineHolder<IO> {
 
 impl<IO> ProcMachineHolder<IO> for Arc<dyn ProcMachine<IO>>
 where
-    IO: 'static + Send,
+    IO: 'static + Send + ?Sized,
 {
     type Guard<'a> = IoArcGuard<'a, IO>;
     #[inline(always)]
@@ -183,18 +183,18 @@ where
 ///
 /// The guard is `!Send` because `ptr` is a raw pointer, which is correct —
 /// a mutex guard should not be sent to another thread.
-pub struct IoArcGuard<'a, IO: 'static + Send> {
+pub struct IoArcGuard<'a, IO: 'static + Send + ?Sized> {
     holder: Arc<dyn ProcMachine<IO>>,
     ptr: Pin<&'a mut IO>,
 }
 
-impl<'a, IO: Send> IoGuard<'a, IO> for IoArcGuard<'a, IO> {
+impl<'a, IO: Send + ?Sized> IoGuard<'a, IO> for IoArcGuard<'a, IO> {
     fn get_pin(&'a self) -> Pin<&'a IO> {
         self.ptr.as_ref()
     }
 }
 
-impl<'a, IO: Send> IoArcGuard<'a, IO> {
+impl<'a, IO: Send + ?Sized> IoArcGuard<'a, IO> {
     /// Acquires the lock and creates a new guard.
     pub fn new(holder: Arc<dyn ProcMachine<IO>>) -> Self {
         let ptr = unsafe {
@@ -207,7 +207,7 @@ impl<'a, IO: Send> IoArcGuard<'a, IO> {
 
 impl<'a, IO> Drop for IoArcGuard<'a, IO>
 where
-    IO: 'static + Send,
+    IO: 'static + Send + ?Sized,
 {
     /// Ticks the machine and releases the lock.
     #[inline]
@@ -220,7 +220,7 @@ where
 
 impl<'a, IO> Deref for IoArcGuard<'a, IO>
 where
-    IO: Send,
+    IO: Send + ?Sized,
 {
     type Target = IO;
     #[inline]
@@ -231,7 +231,7 @@ where
 
 impl<'a, IO> DerefMut for IoArcGuard<'a, IO>
 where
-    IO: Send,
+    IO: Send + ?Sized,
 {
     #[inline]
     fn deref_mut(&mut self) -> &mut IO {
@@ -479,12 +479,12 @@ impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> 
 
 /// The mutex-protected interior: IO + futures + alive tracking.
 #[derive(Debug)]
-struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
+struct ProcMachineInner<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> {
     futures: FUTURES,
-    io: IO,
     /// Bitmask of tasks that have not yet completed. Bit `n` corresponds to
     /// the task at depth `n`. Updated after every `poll` call.
     alive_mask: u32,
+    io: IO,
 }
 
 impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
@@ -495,7 +495,9 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
             alive_mask: 0,
         }
     }
+}
 
+impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
     /// Repeatedly polls tasks until no more wakes are pending.
     ///
     /// Each iteration atomically swaps `wake_mask` to 0 (claiming all
@@ -551,32 +553,32 @@ pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
 /// `unsafe impl Send + Sync`. This is sound because `raw_arc` is
 /// immutable after construction and always points to the Arc's own
 /// allocation, which is guaranteed to be alive while any `&self` exists.
-struct ProcMachineImpl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
-    inner: Mutex<ProcMachineInner<IO, FUTURES>>,
+struct ProcMachineImpl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> {
     wake_mask: AtomicU32,
     external_waker: AtomicWaker,
     raw_arc: *const Self,
+    inner: Mutex<ProcMachineInner<IO, FUTURES>>,
 }
 
 // SAFETY: All mutable state is behind the Mutex or is AtomicU32.
 // raw_arc is immutable after construction and points to the Arc's own
 // allocation (which is alive while any reference exists).
-unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Send
+unsafe impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Send
     for ProcMachineImpl<IO, FUTURES>
 {
 }
-unsafe impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Sync
+unsafe impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Sync
     for ProcMachineImpl<IO, FUTURES>
 {
 }
 
-impl<IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
+impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::fmt::Debug
     for ProcMachineImpl<IO, FUTURES>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let guard = self.inner.lock();
         f.debug_struct("ProcMachineImpl")
-            .field("io", &guard.io)
+            .field("io", &&(guard.io)) // TODO better debug for
             .field("alive_mask", &guard.alive_mask)
             .finish()
     }
@@ -588,7 +590,7 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
 /// the mutex is held (e.g. a task writes to an IoExchange, which wakes
 /// the reader's waker synchronously). Because `wake_mask` is atomic and
 /// lives outside the mutex, this never deadlocks.
-impl<IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
+impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> MultiWake
     for ProcMachineImpl<IO, FUTURES>
 {
     fn wake(&self, n: u8) {
@@ -631,10 +633,10 @@ impl<IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
     ///    exist.
     fn new<JOBS: ProcMachineJobs<IO, FUTURES = FUTURES>>(io: IO, jobs: JOBS) -> Arc<Self> {
         let mut ret = Arc::new(Self {
-            inner: Mutex::new(ProcMachineInner::new(io)),
             wake_mask: AtomicU32::new(0),
             external_waker: AtomicWaker::new(),
             raw_arc: core::ptr::null(),
+            inner: Mutex::new(ProcMachineInner::new(io)),
         });
         // Store a raw self-pointer for later Arc reconstruction in
         // trait-object methods. Safe because we are the sole owner

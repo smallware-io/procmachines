@@ -894,8 +894,8 @@ mod tests {
         assert!(matches!(w.prod_poll_flush(&mut cx), Poll::Pending));
         assert!(matches!(w.prod_poll_flush(&mut cx), Poll::Ready(Ok(()))));
         match w.prod_poll_flush(&mut cx) {
-            Poll::Ready(Err(e)) => {},
-            other => panic!("expected WriteZero, got {:?}", other.map(|_| ())),
+            Poll::Ready(Err(IoError::BrokenPipe)) => {}
+            other => panic!("expected BrokenPipe, got {:?}", other.map(|_| ())),
         }
     }
 

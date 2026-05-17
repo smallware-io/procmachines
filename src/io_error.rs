@@ -4,7 +4,7 @@ use core::ops::Deref;
 use core::str::FromStr;
 
 /// Simple common types of I/O error
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum IoError {
     Unknown,

@@ -1,8 +1,8 @@
-//! Interior-mutable stream trait for async item consumption.
+//! Single-consumer stream trait for async item consumption.
 //!
 //! [`IoStream`] is analogous to [`futures::Stream`], but all methods take
-//! `&self` instead of `Pin<&mut Self>`. This makes it usable through shared
-//! references, matching the design of [`IoSink`](crate::io_sink::IoSink).
+//! `&mut self` instead of `Pin<&mut Self>`, matching the design of
+//! [`IoSink`](crate::io_sink::IoSink).
 //!
 //! The trait is implemented by [`IoExchange`](crate::io_exchange::IoExchange),
 //! which provides the reader half of a single-slot rendezvous channel.
@@ -14,10 +14,10 @@ use core::{
 
 use futures::{Stream, StreamExt};
 
-/// A `Stream`-like trait with interior mutability (`&self` receivers).
+/// A `Stream`-like trait with `&mut self` receivers.
 ///
-/// Provides async item consumption through shared references. Paired with
-/// [`IoSink`](crate::io_sink::IoSink) to form a full duplex channel.
+/// Paired with [`IoSink`](crate::io_sink::IoSink) to form a full duplex
+/// channel.
 ///
 /// # `con_poll*` semantics
 ///
@@ -25,26 +25,21 @@ use futures::{Stream, StreamExt};
 /// "consumer" — a task that is consuming items (or end-of-stream signals)
 /// that have been produced upstream.
 ///
-/// - If a `con_poll*` method returns [`Poll::Pending`], the calling task is
-///   registered to be woken later when the same call might return
-///   [`Poll::Ready`].
-/// - If a `con_poll*` method returns [`Poll::Ready`] **and the return value
-///   indicates that something was actually consumed**, the calling task is
-///   **immediately pre-woken** so it will be re-polled after processing
-///   the output.  This is the opposite of the `prod_poll*` contract on
-///   [`IoSink`](crate::io_sink::IoSink): consumers are expected to drain in
-///   a loop, so a consuming `Ready` keeps the task scheduled to consume
-///   more.
-/// - A `Poll::Ready` that does **not** consume anything does not pre-wake,
-///   but there are no non-consuming `Ready` return values for `con_poll_read`,
-///   so this only applies to other interfaces.
+/// The unifying rule: **the calling task is registered to be woken
+/// whenever calling the same method again might return a different
+/// result.**
 ///
-/// End-of-stream — [`Poll::Ready(None)`](Poll::Ready) from
-/// [`con_poll_read`](IoStream::con_poll_read) — is treated as consumption
-/// for the purposes of this contract: each call consumes one repetition of
-/// the EOS signal and pre-wakes the caller.  The signal is repeatable, so
-/// it is the caller's responsibility to recognise end-of-stream and break
-/// out of any loop that would otherwise consume it forever.
+/// - If a `con_poll*` method returns [`Poll::Pending`], the calling task
+///   is registered to be woken later when the same call might return
+///   [`Poll::Ready`] — the standard `poll` contract.
+/// - If a `con_poll*` method returns [`Poll::Ready`] **and consumes an
+///   item**, the calling task is **pre-woken**, because the next call
+///   cannot return the same item.  Consumers are expected to drain in a
+///   loop, so a consuming `Ready` keeps the task scheduled.
+/// - If a `con_poll*` method returns a terminal [`Poll::Ready`] —
+///   end-of-stream ([`Ready(Ok(None))`](Poll::Ready)) or a persistent
+///   error that the next call would re-emit — the caller is **not**
+///   pre-woken: the same call would just return the same value again.
 pub trait IoStream {
     /// The type of items produced by the stream.
     type Item;
@@ -56,19 +51,23 @@ pub trait IoStream {
     /// Returns:
     /// - `Poll::Ready(Some(item))` — an item was consumed; the caller is
     ///   pre-woken to drain more.
-    /// - `Poll::Ready(None)` — end-of-stream.  Each call consumes one
-    ///   repetition of this repeatable signal and pre-wakes the caller;
-    ///   the caller must recognise EOS and break its read loop.
+    /// - `Poll::Ready(None)` — end-of-stream.  The signal is repeatable;
+    ///   subsequent calls return the same value, so the caller is **not**
+    ///   pre-woken.  The caller must recognise EOS and break its read
+    ///   loop.
     /// - `Poll::Pending` — no item is available yet.  The waker will be notified
     ///   when the state changes.
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>>;
+    fn con_poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>>;
 
     /// Signals that the reader is no longer interested in further items.
     ///
     /// After calling this, the writer side will observe that the reader has
     /// been dropped and will receive appropriate errors on subsequent sends.
     /// Any in-flight item is discarded.
-    fn drop_read(&self);
+    fn drop_read(&mut self);
 }
 
 /// A wrapper around a [`Stream`] that implements the [`IoStream`] trait.
@@ -98,7 +97,10 @@ where
     type Item = ITEM;
     type Error = ERR;
 
-    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+    fn con_poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Self::Item>, Self::Error>> {
         let mut inner = self.inner.borrow_mut();
         if let Some(stream) = inner.as_mut() {
             match stream.poll_next_unpin(cx) {
@@ -108,14 +110,15 @@ where
                     Poll::Ready(Ok(Some(item)))
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    *inner = None; // Transition to EOF state
+                    // Terminal: subsequent calls return EOF, but this
+                    // particular error is one-shot, so pre-wake.
+                    *inner = None;
                     cx.waker().wake_by_ref();
                     Poll::Ready(Err(e))
                 }
                 Poll::Ready(None) => {
-                    // End-of-stream; consume the signal and pre-wake the caller.
-                    *inner = None; // Transition to EOF state
-                    cx.waker().wake_by_ref();
+                    // End-of-stream — terminal and repeatable; no pre-wake.
+                    *inner = None;
                     Poll::Ready(Ok(None))
                 }
                 Poll::Pending => Poll::Pending,
@@ -126,7 +129,7 @@ where
         }
     }
 
-    fn drop_read(&self) {
+    fn drop_read(&mut self) {
         *self.inner.borrow_mut() = None; // Transition to EOF state
     }
 }

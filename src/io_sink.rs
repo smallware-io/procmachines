@@ -1,10 +1,8 @@
-//! Single-producer, interior-mutable sink trait for async item delivery.
+//! Single-producer sink trait for async item delivery.
 //!
-//! [`IoSink`] is analogous to [`futures::Sink`], but all methods take `&self`
-//! instead of `Pin<&mut Self>`. This makes it easily usable through shared
-//! references (e.g. behind an `Arc` or embedded in a struct that multiple tasks can
-//! access). The trade-off is that implementations must handle their own
-//! synchronization.
+//! [`IoSink`] is analogous to [`futures::Sink`], but all methods take
+//! `&mut self` instead of `Pin<&mut Self>`, so implementations do not need
+//! to be pinned.
 //!
 //! The trait is implemented by [`IoExchange`](crate::io_exchange::IoExchange),
 //! which provides a single-slot rendezvous channel between a writer and reader
@@ -16,11 +14,10 @@ use core::{
 
 use futures::{Sink, SinkExt};
 
-/// A single-producer `Sink`-like trait with interior mutability (`&self` receivers).
+/// A single-producer `Sink`-like trait with `&mut self` receivers.
 ///
-/// All methods take `&self`, enabling use from contexts that only have a
-/// shared reference to the sink. Implementations must be `Send` so the sink
-/// can be shared across tasks.
+/// Implementations are expected to be `Send` so the sink can be moved
+/// between tasks.
 ///
 /// # Protocol
 ///
@@ -31,23 +28,33 @@ use futures::{Sink, SinkExt};
 /// 3. Optionally [`prod_poll_flush`](IoSink::prod_poll_flush) — ensure delivery.
 /// 4. [`prod_poll_close`](IoSink::prod_poll_close) — signal end-of-stream.
 ///
-/// Multiple callers may share the `&self` reference, but individual
-/// implementations (e.g. `IoExchange`) may still be single-producer.
-///
 /// # `prod_poll*` semantics
 ///
 /// The `prod_poll*` methods on this trait are intended for use by a single
 /// "producer" — a task that is producing items (or progress toward delivery)
-/// to be consumed downstream.  Each `prod_poll*` method behaves like
-/// [`Future::poll`]:
+/// to be consumed downstream.
 ///
-/// - If it returns [`Poll::Pending`], the calling task is registered to be
-///   woken later when the same call might return [`Poll::Ready`].
-/// - Unlike other kinds of `poll*` methods (e.g. `watch_poll*`), the calling
-///   task is **not** registered or pre-woken when a `prod_poll*` method
-///   returns [`Poll::Ready`].  A `Ready` return is simply a signal that the
-///   producer may proceed; it is the producer's responsibility to keep
-///   calling until something blocks.
+/// The unifying rule: **whenever a `prod_poll*` return indicates that
+/// transmission of the requested information to the receiver is not yet
+/// complete, the calling task is arranged to wake when more progress can
+/// be made.**
+///
+/// - If it returns [`Poll::Pending`], the calling task is registered to
+///   be woken later when the same call might return [`Poll::Ready`] —
+///   the standard `poll` contract.
+/// - If it returns [`Poll::Ready`] indicating **complete** transmission
+///   (e.g. the item was accepted, or a flush or close handshake was
+///   acknowledged), the calling task is **not** pre-woken.  A `Ready`
+///   return is simply a signal that the producer may proceed.
+/// - If it returns [`Poll::Ready`] indicating only **partial** progress,
+///   the calling task is arranged to wake when more progress can be
+///   made.  Implementations should prefer registering the waker on the
+///   underlying blocking condition; if that is not feasible, they pre-wake
+///   the caller so the producer re-polls and either makes more progress
+///   or observes the blocking condition itself.  None of the sink
+///   methods defined here currently have partial-completion returns —
+///   items are atomic — but the rule applies to any future extensions
+///   that gain them.
 ///
 /// Producers are expected to produce everything they can without blocking.
 /// Consequently, if no `prod_poll*` method ever returns [`Poll::Pending`],
@@ -63,7 +70,7 @@ pub trait IoSink<ITEM> {
     /// Returns `Poll::Ready(Ok(()))` when a subsequent [`prod_poll_send`](IoSink::prod_poll_send)
     /// is expected to succeed immediately, assuming no other caller intervenes.
     /// Returns `Poll::Pending` when the sink is full or busy.
-    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn prod_poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 
     /// Attempts to send an item into the sink.
     ///
@@ -74,7 +81,7 @@ pub trait IoSink<ITEM> {
     /// If `item` is `None` on entry, returns `Poll::Ready(Ok(()))` immediately
     /// (no-op send).
     fn prod_poll_send(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         item: &mut Option<ITEM>,
     ) -> Poll<Result<(), Self::Error>>;
@@ -87,7 +94,7 @@ pub trait IoSink<ITEM> {
     /// that observes the empty slot (confirming it has seen all sent data).
     ///
     /// Returns `Poll::Ready(Ok(()))` once the flush is acknowledged.
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn prod_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 
     /// Signals that no further items will be sent and waits for the close
     /// handshake to complete.
@@ -97,7 +104,7 @@ pub trait IoSink<ITEM> {
     /// it.
     ///
     /// Returns `Poll::Ready(Ok(()))` once the close is fully acknowledged.
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn prod_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }
 
 /// A wrapper around a [`Sink`] that implements the [`IoSink`] trait.
@@ -127,12 +134,12 @@ where
 {
     type Error = SINK::Error;
 
-    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn prod_poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.borrow_mut().poll_ready_unpin(cx)
     }
 
     fn prod_poll_send(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         item: &mut Option<ITEM>,
     ) -> Poll<Result<(), Self::Error>> {
@@ -151,11 +158,11 @@ where
         }
     }
 
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn prod_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.borrow_mut().poll_flush_unpin(cx)
     }
 
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn prod_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.borrow_mut().poll_close_unpin(cx)
     }
 }

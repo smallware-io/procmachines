@@ -1,39 +1,35 @@
 //! Single-slot, lock-assisted async byte-stream exchange.
 //!
 //! [`IoBytesExchange`] is a bounded, single-producer / single-consumer
-//! channel that transfers [`Bytes`] values one at a time through an
-//! interior-mutable shared reference.  It implements both [`IoReader`]
-//! (consumer side) and [`IoWriter`] (producer side).
+//! channel that transfers [`Bytes`] values one at a time.  It implements
+//! both [`IoReader`] (consumer side) and [`IoWriter`] (producer side); the
+//! two trait methods take `&mut self`, so callers that need to share the
+//! exchange between producer and consumer tasks must arrange exclusive
+//! access (e.g. by wrapping it in a lock).
 //!
 //! # Design
 //!
-//! The exchange holds at most one in-flight [`Bytes`] value.  An atomic
-//! state byte ([`AtomicU8`]) encodes the current lifecycle phase, while a
-//! [`Mutex<Bytes>`] protects the payload itself.  Two [`AtomicWaker`]s
-//! (one per side) handle task wake-ups.
+//! The exchange holds at most one in-flight [`Bytes`] value.  The [`State`]
+//! enum encodes the current lifecycle phase, and two [`WakerRef`]s (one
+//! per side) handle task wake-ups.
 //!
-//! The state machine has eight states (see the `EXCH_*` constants) that
+//! The state machine has eight states (see the [`State`] variants) that
 //! track slot occupancy, flush handshaking, close sequencing, and reader
-//! drop.  All transitions use compare-and-swap or are performed under the
-//! data mutex to avoid races between the reader and writer.
+//! drop.
 
-use core::{
-    sync::atomic::{AtomicU8, Ordering},
-    task::{Context, Poll},
-};
-use lock_api::{Mutex, RawMutex};
+use core::task::{Context, Poll};
 
 use crate::io_error::IoError;
 use bytes::Bytes;
-use futures::task::AtomicWaker;
 
-use crate::{io_reader::IoReader, io_writer::IoWriter};
+use crate::{io_reader::IoReader, io_writer::IoWriter, waker_ref::WakerRef};
 
 /// A single-slot, lock-assisted async byte-stream exchange.
 ///
 /// Implements both [`IoWriter`] (producer/writer side) and [`IoReader`]
-/// (consumer/reader side) using interior mutability, so both halves can
-/// be accessed through a single shared `&IoBytesExchange` reference.
+/// (consumer/reader side).  The trait methods take `&mut self`; callers
+/// that share the exchange between separate producer and consumer tasks
+/// must arrange exclusive access (e.g. by wrapping it in a lock).
 ///
 /// # Lifecycle
 ///
@@ -50,83 +46,74 @@ use crate::{io_reader::IoReader, io_writer::IoWriter};
 ///  any    ─drop_read─▶ DROPPED   (reader gives up)
 /// ```
 #[derive(Debug)]
-pub struct IoBytesExchange<R: RawMutex> {
+pub struct IoBytesExchange {
     /// Waker for the reader side, notified when an item is placed or the
     /// stream is closed.
-    reader: AtomicWaker,
+    reader: WakerRef,
     /// Waker for the writer side, notified when the reader consumes the
     /// item (freeing the slot) or drops.
-    writer: AtomicWaker,
-    /// Atomic state machine governing the exchange lifecycle.
-    state: AtomicU8,
+    writer: WakerRef,
+    /// State machine governing the exchange lifecycle.
+    state: State,
     /// Stored payload
-    data: Mutex<R, Bytes>,
+    data: Bytes,
 }
 
-// ---------------------------------------------------------------------------
-// State machine constants
-// ---------------------------------------------------------------------------
-//
-// The lifecycle is encoded as a single `u8`.  States 0–2 represent an
-// empty slot (no data in flight), states 3–5 represent a full slot
-// (data waiting for the reader), and states 6–7 are terminal.
-//
-//  ┌───────────────── empty ──────────────────┐  ┌────── full ──────┐  ┌─ terminal ─┐
-//  │  EMPTY  EMPTY_FLUSH  EMPTY_FLUSHED       │  │ FULL  FULL_FLUSH │  │ DONE       │
-//  │   (0)      (1)           (2)             │  │  (3)     (4)     │  │  (6)       │
-//  └──────────────────────────────────────────┘  │     FULL_CLOSED  │  │ DROPPED    │
-//                                                │        (5)       │  │  (7)       │
-//                                                └──────────────────┘  └────────────┘
+/// Lifecycle phase of an [`IoBytesExchange`].
+///
+/// `Empty*` variants describe an empty slot (no data in flight),
+/// `Full*` variants describe a full slot (data waiting for the reader),
+/// and `Done` / `Dropped` are terminal.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum State {
+    /// Slot is empty, no flush requested.
+    Empty,
+    /// Slot is empty; the writer has requested a flush but the reader has
+    /// not yet acknowledged it (i.e., the reader has not polled and
+    /// observed the empty slot since the flush was requested).
+    EmptyFlush,
+    /// Slot is empty and the reader has acknowledged the flush by
+    /// observing the empty slot after the flush request.  The writer can
+    /// now treat the flush as complete.
+    EmptyFlushed,
+    /// Slot contains data, no flush or close pending.
+    Full,
+    /// Slot contains data and a flush has been requested.  After the
+    /// reader consumes the data the state drops to `EmptyFlush`.
+    FullFlush,
+    /// Slot contains the **final** chunk of data.  After the reader
+    /// consumes it the state transitions directly to `Done`.
+    FullClosed,
+    /// The stream is finished — the reader will see `None` from now on.
+    Done,
+    /// The reader called [`IoReader::drop_read`]; further writes will
+    /// return [`IoError::BrokenPipe`].
+    Dropped,
+}
 
-/// Slot is empty, no flush requested.
-const EXCH_EMPTY: u8 = 0;
-/// Slot is empty; the writer has requested a flush but the reader has not
-/// yet acknowledged it (i.e., the reader has not polled and observed the
-/// empty slot since the flush was requested).
-const EXCH_EMPTY_FLUSH: u8 = 1;
-/// Slot is empty and the reader has acknowledged the flush by observing
-/// the empty slot after the flush request.  The writer can now treat the
-/// flush as complete.
-const EXCH_EMPTY_FLUSHED: u8 = 2;
-/// Slot contains data, no flush or close pending.
-const EXCH_FULL: u8 = 3;
-/// Slot contains data and a flush has been requested.  After the reader
-/// consumes the data the state drops to `EMPTY_FLUSH`.
-const EXCH_FULL_FLUSH: u8 = 4;
-/// Slot contains the **final** chunk of data.  After the reader consumes
-/// it the state transitions directly to `DONE`.
-const EXCH_FULL_CLOSED: u8 = 5;
-/// The stream is finished — the reader will see `None` from now on.
-const EXCH_DONE: u8 = 6;
-/// The reader called [`IoReader::drop_read`]; further writes will return
-/// [`ExchangeWriteError::ReaderDropped`].
-const EXCH_DROPPED: u8 = 7;
-
-impl<R: RawMutex> Default for IoBytesExchange<R> {
+impl Default for IoBytesExchange {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R: RawMutex> IoBytesExchange<R> {
+impl IoBytesExchange {
     /// Creates a new, empty exchange in the `EMPTY` state.
     pub fn new() -> Self {
         Self {
-            reader: AtomicWaker::new(),
-            writer: AtomicWaker::new(),
-            state: AtomicU8::new(EXCH_EMPTY),
-            data: Mutex::new(Bytes::new()),
+            reader: WakerRef::new(),
+            writer: WakerRef::new(),
+            state: State::Empty,
+            data: Bytes::new(),
         }
     }
 
     /// Resets the exchange to its initial `EMPTY` state, discarding any
     /// in-flight data and waking any registered reader or writer so they
     /// re-poll and observe the fresh state.
-    pub fn reset(&self) {
-        let mut guard = self.data.lock();
-        self.state.store(EXCH_EMPTY, Ordering::SeqCst);
-        *guard = Bytes::new();
-        drop(guard);
+    pub fn reset(&mut self) {
+        self.state = State::Empty;
+        self.data = Bytes::new();
         self.reader.wake();
         self.writer.wake();
     }
@@ -136,68 +123,49 @@ impl<R: RawMutex> IoBytesExchange<R> {
 // IoReader (consumer / reader side)
 // ---------------------------------------------------------------------------
 
-impl<R: RawMutex + Send> IoReader for IoBytesExchange<R> {
+impl IoReader for IoBytesExchange {
     type Error = IoError;
 
     fn con_poll_read(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<Result<Option<Bytes>, Self::Error>> {
-        // Hold the data lock so state and payload stay in sync with the
-        // writer during transitions that touch both.
-        let mut guard = self.data.lock();
-        let st = self.state.load(Ordering::Acquire);
+        let st = self.state;
 
         let nextst = match st {
             // Already flushed; nothing to do until the writer sends more
             // data or closes.
-            EXCH_EMPTY_FLUSHED => {
+            State::EmptyFlushed => {
                 self.reader.register(cx.waker());
-                if st != self.state.load(Ordering::Acquire) {
-                    cx.waker().wake_by_ref();
-                }
                 return Poll::Pending;
             }
             // Slot is empty; observing it acknowledges any pending flush.
             // Transition to EMPTY_FLUSHED (same move in both sub-cases).
-            EXCH_EMPTY | EXCH_EMPTY_FLUSH => {
+            State::Empty | State::EmptyFlush => {
                 self.reader.register(cx.waker());
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_EMPTY_FLUSHED, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err()
-                {
-                    // Writer raced us (e.g. prod_poll_close); re-poll to
-                    // re-evaluate.
-                    cx.waker().wake_by_ref();
-                }
+                self.state = State::EmptyFlushed;
                 self.writer.wake();
                 return Poll::Pending;
             }
             // Full states — map to the corresponding post-consume state.
-            EXCH_FULL => EXCH_EMPTY,
-            EXCH_FULL_FLUSH => EXCH_EMPTY_FLUSH,
-            EXCH_FULL_CLOSED => EXCH_DONE,
-            // Terminal (DONE or DROPPED) — end-of-stream, repeatable.
+            State::Full => State::Empty,
+            State::FullFlush => State::EmptyFlush,
+            State::FullClosed => State::Done,
+            // Terminal (DONE or DROPPED) — end-of-stream.  Repeatable,
+            // so per the con_poll* contract we do not pre-wake.
             _ => {
-                // con_poll* contract: each EOS return counts as consuming
-                // one repetition of the signal, so pre-wake the caller.
-                // The caller must recognise EOS and break its loop.
-                cx.waker().wake_by_ref();
                 return Poll::Ready(Ok(None));
             }
         };
 
         // --- We are in a FULL* state and expect payload data. ---
 
-        if guard.is_empty() {
+        if self.data.is_empty() {
             // Defensive: state claimed FULL but slot is empty.  Transition
             // to nextst and self-wake so the caller re-polls into the
             // correct branch.
-            let _ = self
-                .state
-                .compare_exchange(st, nextst, Ordering::SeqCst, Ordering::SeqCst);
+            self.state = nextst;
             self.writer.wake();
             cx.waker().wake_by_ref();
             return Poll::Pending;
@@ -212,19 +180,18 @@ impl<R: RawMutex + Send> IoReader for IoBytesExchange<R> {
 
         // Consume up to `max_len` bytes out of the slot.
         let mut data = Bytes::new();
-        core::mem::swap(&mut data, &mut *guard);
+        core::mem::swap(&mut data, &mut self.data);
 
         if data.len() > max_len {
             // Partial read — put the remainder back, stay in FULL* state.
-            *guard = data.split_off(max_len);
+            self.data = data.split_off(max_len);
         } else {
             // All data consumed — advance to nextst.
-            self.state.store(nextst, Ordering::Release);
+            self.state = nextst;
         }
         // The slot may now have room (or the stream is done); notify the
         // writer either way.
         self.writer.wake();
-        drop(guard);
 
         // con_poll* contract: bytes were actually consumed, so pre-wake
         // the caller to keep it scheduled to drain more.
@@ -232,16 +199,15 @@ impl<R: RawMutex + Send> IoReader for IoBytesExchange<R> {
         Poll::Ready(Ok(Some(data)))
     }
 
-    fn drop_read(&self) {
-        let mut guard = self.data.lock();
-        let st = self.state.load(Ordering::Acquire);
+    fn drop_read(&mut self) {
+        let st = self.state;
         match st {
-            EXCH_DROPPED | EXCH_DONE => (),
+            State::Dropped | State::Done => (),
             _ => {
                 // Force-terminate: discard any in-flight data and move
                 // to the DROPPED terminal state.
-                self.state.store(EXCH_DROPPED, Ordering::Release);
-                *guard = Bytes::new();
+                self.state = State::Dropped;
+                self.data = Bytes::new();
                 self.writer.wake();
             }
         }
@@ -252,7 +218,7 @@ impl<R: RawMutex + Send> IoReader for IoBytesExchange<R> {
 // IoWriter (producer / writer side)
 // ---------------------------------------------------------------------------
 
-impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
+impl IoWriter for IoBytesExchange {
     type Error = IoError;
 
     /// Places data into the exchange slot.
@@ -261,7 +227,7 @@ impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
     /// (the slot can hold an arbitrarily large [`Bytes`]).  On success the
     /// `data` handle is left empty and the byte count is returned.
     fn prod_poll_write(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         data: &mut Bytes,
     ) -> Poll<Result<usize, IoError>> {
@@ -270,39 +236,25 @@ impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
         if data.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let mut guard = self.data.lock();
-        let st = self.state.load(Ordering::Acquire);
+        let st = self.state;
         match st {
             // Any empty sub-state → place data and move to FULL.
-            EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_FULL, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    let sz = data.len();
-                    let mut t = Bytes::new();
-                    core::mem::swap(&mut t, data);
-                    *guard = t;
-                    self.reader.wake();
-                    Poll::Ready(Ok(sz))
-                } else {
-                    // CAS failure under our mutex shouldn't happen in
-                    // single-producer usage; stay defensive and re-poll.
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
+            State::Empty | State::EmptyFlush | State::EmptyFlushed => {
+                self.state = State::Full;
+                let sz = data.len();
+                let mut t = Bytes::new();
+                core::mem::swap(&mut t, data);
+                self.data = t;
+                self.reader.wake();
+                Poll::Ready(Ok(sz))
             }
             // Slot is occupied — back-pressure.
-            EXCH_FULL | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
+            State::Full | State::FullFlush | State::FullClosed => {
                 self.writer.register(cx.waker());
-                if st != self.state.load(Ordering::Acquire) {
-                    cx.waker().wake_by_ref();
-                }
                 Poll::Pending
             }
             // Reader is gone.
-            EXCH_DROPPED => Poll::Ready(Err(IoError::BrokenPipe)),
+            State::Dropped => Poll::Ready(Err(IoError::BrokenPipe)),
             // DONE or any unexpected value.
             _ => Poll::Ready(Err(IoError::InvalidState)),
         }
@@ -316,50 +268,29 @@ impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
     /// 2. The reader eventually observes the empty slot and transitions to
     ///    `EMPTY_FLUSHED`.
     /// 3. The writer sees `EMPTY_FLUSHED` and returns `Ready(Ok(()))`.
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        let st = self.state.load(Ordering::Acquire);
+    fn prod_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        let st = self.state;
         match st {
             // A flush or close is already in progress — wait for the
             // reader to make progress.
-            EXCH_EMPTY_FLUSH | EXCH_FULL_FLUSH | EXCH_FULL_CLOSED => {
+            State::EmptyFlush | State::FullFlush | State::FullClosed => {
                 self.writer.register(cx.waker());
-                if st != self.state.load(Ordering::Acquire) {
-                    cx.waker().wake_by_ref();
-                }
                 Poll::Pending
             }
             // Reader has acknowledged the flush.
-            EXCH_EMPTY_FLUSHED => Poll::Ready(Ok(())),
+            State::EmptyFlushed => Poll::Ready(Ok(())),
             // Slot empty, no flush yet — request one.
-            EXCH_EMPTY => {
+            State::Empty => {
                 self.writer.register(cx.waker());
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_EMPTY_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.reader.wake();
-                } else {
-                    // CAS failed — state raced (e.g. drop_read); re-poll.
-                    cx.waker().wake_by_ref();
-                }
+                self.state = State::EmptyFlush;
+                self.reader.wake();
                 Poll::Pending
             }
             // Data still in flight — tag the flush onto it.
-            EXCH_FULL => {
+            State::Full => {
                 self.writer.register(cx.waker());
-                // Hold the data lock so the reader cannot consume the
-                // payload (and change the state) between our load and CAS.
-                let _guard = self.data.lock();
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_FULL_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.reader.wake();
-                } else {
-                    cx.waker().wake_by_ref();
-                }
+                self.state = State::FullFlush;
+                self.reader.wake();
                 Poll::Pending
             }
             // Terminal (DONE or DROPPED) — nothing left to flush.
@@ -372,47 +303,25 @@ impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
     /// If the slot is empty the exchange moves directly to `DONE`.  If data
     /// is still in flight the state becomes `FULL_CLOSED`, allowing the
     /// reader to consume the last chunk before seeing end-of-stream.
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        let st = self.state.load(Ordering::Acquire);
+    fn prod_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        let st = self.state;
         match st {
             // Any empty sub-state — go straight to DONE.
-            EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_DONE, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.reader.wake();
-                    Poll::Ready(Ok(()))
-                } else {
-                    // CAS raced (e.g. drop_read); re-poll.
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
+            State::Empty | State::EmptyFlush | State::EmptyFlushed => {
+                self.state = State::Done;
+                self.reader.wake();
+                Poll::Ready(Ok(()))
             }
             // Data in flight — mark as "last chunk, then close".
-            EXCH_FULL | EXCH_FULL_FLUSH => {
+            State::Full | State::FullFlush => {
                 self.writer.register(cx.waker());
-                // Hold the data lock so the reader cannot consume the
-                // payload (and change the state) between our load and CAS.
-                let _guard = self.data.lock();
-                if self
-                    .state
-                    .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    self.reader.wake();
-                } else {
-                    cx.waker().wake_by_ref();
-                }
+                self.state = State::FullClosed;
+                self.reader.wake();
                 Poll::Pending
             }
             // Already waiting for the reader to take the last chunk.
-            EXCH_FULL_CLOSED => {
+            State::FullClosed => {
                 self.writer.register(cx.waker());
-                if st != self.state.load(Ordering::Acquire) {
-                    cx.waker().wake_by_ref();
-                }
                 Poll::Pending
             }
             // Terminal (DONE or DROPPED) — already finished.
@@ -428,8 +337,8 @@ impl<R: RawMutex + Send> IoWriter for IoBytesExchange<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::RawMutex;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll, Wake};
 
     // -----------------------------------------------------------------------
@@ -480,9 +389,9 @@ mod tests {
 
     #[test]
     fn new_exchange_starts_empty() {
-        let ex = IoBytesExchange::<RawMutex>::new();
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
-        assert!(ex.data.lock().is_empty());
+        let ex = IoBytesExchange::new();
+        assert_eq!(ex.state, State::Empty);
+        assert!(ex.data.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -491,26 +400,26 @@ mod tests {
 
     #[test]
     fn write_then_read() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"hello");
-        let n = match IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload) {
+        let n = match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload) {
             Poll::Ready(Ok(n)) => n,
             other => panic!("expected Ready(Ok(_)), got {:?}", other),
         };
         assert_eq!(n, 5);
         assert!(payload.is_empty());
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        assert_eq!(ex.state, State::Full);
 
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"hello"),
             other => panic!("expected Ready(Ok(Some(hello))), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
+        assert_eq!(ex.state, State::Empty);
     }
 
     // -----------------------------------------------------------------------
@@ -519,28 +428,28 @@ mod tests {
 
     #[test]
     fn write_empty_bytes_is_noop() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
         let mut empty = Bytes::new();
-        match IoWriter::prod_poll_write(&ex, &mut wcx, &mut empty) {
+        match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut empty) {
             Poll::Ready(Ok(0)) => {}
             other => panic!("expected Ready(Ok(0)), got {:?}", other),
         }
         // State should still be EMPTY — nothing was sent.
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
+        assert_eq!(ex.state, State::Empty);
     }
 
     #[test]
     fn read_zero_on_empty_returns_pending() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         // max_len=0 on an empty exchange should return Pending (no data,
         // and we can't say the stream is in error).
-        match IoReader::con_poll_read(&ex, &mut rcx, 0) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 0) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
@@ -548,23 +457,23 @@ mod tests {
 
     #[test]
     fn read_zero_on_full_returns_some_empty() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
 
         let mut payload = Bytes::from_static(b"data");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
 
         rw.reset();
         // max_len=0 on a full exchange: "stream is alive" → Some(empty).
-        match IoReader::con_poll_read(&ex, &mut rcx, 0) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 0) {
             Poll::Ready(Ok(Some(data))) => assert!(data.is_empty()),
             other => panic!("expected Ready(Ok(Some(empty))), got {:?}", other),
         }
         // Data should still be in the slot (not consumed).
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        assert_eq!(ex.state, State::Full);
         // con_poll* contract: a non-consuming Ready (max_len == 0 probe on
         // a live stream) must not pre-wake the caller.
         assert_eq!(rw.count(), 0, "max_len=0 probe must not pre-wake");
@@ -576,23 +485,23 @@ mod tests {
 
     #[test]
     fn partial_read_splits_data() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
 
         let mut payload = Bytes::from_static(b"abcdef");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
 
         // Read only 3 bytes.
         rw.reset();
-        match IoReader::con_poll_read(&ex, &mut rcx, 3) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 3) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"abc"),
             other => panic!("expected 'abc', got {:?}", other),
         }
         // State should still be FULL (remainder in slot).
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        assert_eq!(ex.state, State::Full);
         // Reader should have been pre-emptively woken (more data available).
         assert!(
             rw.count() > 0,
@@ -600,11 +509,11 @@ mod tests {
         );
 
         // Read the rest.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"def"),
             other => panic!("expected 'def', got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
+        assert_eq!(ex.state, State::Empty);
     }
 
     // -----------------------------------------------------------------------
@@ -613,16 +522,16 @@ mod tests {
 
     #[test]
     fn write_when_full_returns_pending() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
         let mut a = Bytes::from_static(b"first");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut a);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut a);
+        assert_eq!(ex.state, State::Full);
 
         let mut b = Bytes::from_static(b"second");
-        match IoWriter::prod_poll_write(&ex, &mut wcx, &mut b) {
+        match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut b) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
@@ -634,11 +543,11 @@ mod tests {
 
     #[test]
     fn read_on_empty_returns_pending() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
@@ -650,32 +559,32 @@ mod tests {
 
     #[test]
     fn writer_is_woken_after_read_frees_slot() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (ww, wwaker) = make_waker();
         let mut wcx = Context::from_waker(&wwaker);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"x");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
 
         // Second write should Pend and register the writer waker.
         ww.reset();
         let mut more = Bytes::from_static(b"y");
         assert!(matches!(
-            IoWriter::prod_poll_write(&ex, &mut wcx, &mut more),
+            IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut more),
             Poll::Pending
         ));
 
         // Reader consumes → writer should be woken.
         ww.reset();
-        let _ = IoReader::con_poll_read(&ex, &mut rcx, 1024);
+        let _ = IoReader::con_poll_read(&mut ex, &mut rcx, 1024);
         assert!(ww.count() > 0, "writer should be woken when slot is freed");
     }
 
     #[test]
     fn reader_is_woken_after_write_fills_slot() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
@@ -684,14 +593,14 @@ mod tests {
         // Reader tries to read an empty slot.
         rw.reset();
         assert!(matches!(
-            IoReader::con_poll_read(&ex, &mut rcx, 1024),
+            IoReader::con_poll_read(&mut ex, &mut rcx, 1024),
             Poll::Pending
         ));
 
         // Writer places data → reader should be woken.
         rw.reset();
         let mut payload = Bytes::from_static(b"wake-up");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
         assert!(rw.count() > 0, "reader should be woken when data arrives");
     }
 
@@ -701,28 +610,28 @@ mod tests {
 
     #[test]
     fn flush_on_empty_completes_after_reader_ack() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         // Flush on an empty slot: writer requests flush.
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSH);
+        assert_eq!(ex.state, State::EmptyFlush);
 
         // Reader polls and acknowledges the flush.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Pending => {}
             other => panic!("expected Pending (ack), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSHED);
+        assert_eq!(ex.state, State::EmptyFlushed);
 
         // Writer sees the acknowledgement.
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
@@ -730,7 +639,7 @@ mod tests {
 
     #[test]
     fn flush_on_full_completes_after_read_and_ack() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -738,29 +647,29 @@ mod tests {
 
         // Write data, then flush.
         let mut payload = Bytes::from_static(b"flush-me");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_FLUSH);
+        assert_eq!(ex.state, State::FullFlush);
 
         // Reader consumes the data → state becomes EMPTY_FLUSH.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"flush-me"),
             other => panic!("expected data, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSH);
+        assert_eq!(ex.state, State::EmptyFlush);
 
         // Reader polls again → acknowledges the flush.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Pending => {}
             other => panic!("expected Pending (ack), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSHED);
+        assert_eq!(ex.state, State::EmptyFlushed);
 
         // Writer sees flush complete.
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
@@ -768,18 +677,18 @@ mod tests {
 
     #[test]
     fn flush_already_flushed_returns_ready() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         // Get to EMPTY_FLUSHED via the normal path.
-        let _ = IoWriter::prod_poll_flush(&ex, &mut wcx); // EMPTY → EMPTY_FLUSH
-        let _ = IoReader::con_poll_read(&ex, &mut rcx, 1024); // EMPTY_FLUSH → EMPTY_FLUSHED
+        let _ = IoWriter::prod_poll_flush(&mut ex, &mut wcx); // EMPTY → EMPTY_FLUSH
+        let _ = IoReader::con_poll_read(&mut ex, &mut rcx, 1024); // EMPTY_FLUSH → EMPTY_FLUSHED
 
         // A second flush should return Ready immediately.
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected immediate Ready(Ok(())), got {:?}", other),
         }
@@ -791,20 +700,20 @@ mod tests {
 
     #[test]
     fn close_on_empty_goes_to_done() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
 
         // Reader sees EOF.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected Ready(Ok(None)), got {:?}", other),
         }
@@ -812,7 +721,7 @@ mod tests {
 
     #[test]
     fn close_on_full_delivers_last_item_then_eof() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -820,22 +729,22 @@ mod tests {
 
         // Write data then close.
         let mut payload = Bytes::from_static(b"last");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_CLOSED);
+        assert_eq!(ex.state, State::FullClosed);
 
         // Reader gets the last item.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"last"),
             other => panic!("expected data, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
 
         // Subsequent read returns EOF.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other),
         }
@@ -843,15 +752,15 @@ mod tests {
 
     #[test]
     fn close_is_idempotent() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::Done);
 
         // Closing again should still return Ok.
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
@@ -863,31 +772,31 @@ mod tests {
 
     #[test]
     fn drop_read_signals_writer() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (ww, wwaker) = make_waker();
         let mut wcx = Context::from_waker(&wwaker);
 
         // Fill the slot so a second write has to block (Pending path
         // registers the writer's waker, per the prod_poll* contract).
         let mut payload = Bytes::from_static(b"first");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
         let mut more = Bytes::from_static(b"second");
         assert!(matches!(
-            IoWriter::prod_poll_write(&ex, &mut wcx, &mut more),
+            IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut more),
             Poll::Pending
         ));
 
         // Reader drops — the registered writer waker should fire.
         ww.reset();
-        IoReader::drop_read(&ex);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
+        ex.drop_read();
+        assert_eq!(ex.state, State::Dropped);
         // In-flight data should be discarded.
-        assert!(ex.data.lock().is_empty());
+        assert!(ex.data.is_empty());
         assert!(ww.count() > 0, "writer should be woken on reader drop");
 
         // Subsequent write returns ReaderDropped.
         let mut more = Bytes::from_static(b"nope");
-        match IoWriter::prod_poll_write(&ex, &mut wcx, &mut more) {
+        match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut more) {
             Poll::Ready(Err(IoError::BrokenPipe)) => {}
             other => panic!("expected ReaderDropped, got {:?}", other),
         }
@@ -895,15 +804,15 @@ mod tests {
 
     #[test]
     fn drop_read_on_empty() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        IoReader::drop_read(&ex);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
+        ex.drop_read();
+        assert_eq!(ex.state, State::Dropped);
 
         let mut data = Bytes::from_static(b"x");
-        match IoWriter::prod_poll_write(&ex, &mut wcx, &mut data) {
+        match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut data) {
             Poll::Ready(Err(IoError::BrokenPipe)) => {}
             other => panic!("expected ReaderDropped, got {:?}", other),
         }
@@ -911,23 +820,23 @@ mod tests {
 
     #[test]
     fn drop_read_is_idempotent() {
-        let ex = IoBytesExchange::<RawMutex>::new();
-        IoReader::drop_read(&ex);
-        IoReader::drop_read(&ex); // should not panic
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
+        let mut ex = IoBytesExchange::new();
+        IoReader::drop_read(&mut ex);
+        IoReader::drop_read(&mut ex); // should not panic
+        assert_eq!(ex.state, State::Dropped);
     }
 
     #[test]
     fn drop_read_after_done_is_noop() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::Done);
 
-        IoReader::drop_read(&ex);
+        IoReader::drop_read(&mut ex);
         // Should stay DONE, not change to DROPPED.
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
     }
 
     // -----------------------------------------------------------------------
@@ -936,16 +845,16 @@ mod tests {
 
     #[test]
     fn read_after_done_returns_none() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
 
         for _ in 0..3 {
-            match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+            match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
                 Poll::Ready(Ok(None)) => {}
                 other => panic!("expected None, got {:?}", other),
             }
@@ -954,13 +863,13 @@ mod tests {
 
     #[test]
     fn read_after_dropped_returns_none() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
-        IoReader::drop_read(&ex);
+        IoReader::drop_read(&mut ex);
 
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
@@ -972,14 +881,14 @@ mod tests {
 
     #[test]
     fn write_after_done_returns_error() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
 
         let mut data = Bytes::from_static(b"too late");
-        match IoWriter::prod_poll_write(&ex, &mut wcx, &mut data) {
+        match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut data) {
             Poll::Ready(Err(_)) => {}
             other => panic!("expected error after DONE, got {:?}", other),
         }
@@ -991,13 +900,13 @@ mod tests {
 
     #[test]
     fn flush_after_done_returns_ok() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
 
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ok after DONE, got {:?}", other),
         }
@@ -1005,13 +914,13 @@ mod tests {
 
     #[test]
     fn flush_after_dropped_returns_ok() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        IoReader::drop_read(&ex);
+        IoReader::drop_read(&mut ex);
 
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ok after DROPPED, got {:?}", other),
         }
@@ -1019,13 +928,13 @@ mod tests {
 
     #[test]
     fn close_after_dropped_returns_ok() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        IoReader::drop_read(&ex);
+        IoReader::drop_read(&mut ex);
 
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ok after DROPPED, got {:?}", other),
         }
@@ -1037,7 +946,7 @@ mod tests {
 
     #[test]
     fn close_on_full_flush_transitions_to_full_closed() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1045,23 +954,23 @@ mod tests {
 
         // Write + flush → FULL_FLUSH.
         let mut payload = Bytes::from_static(b"data");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
-        let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_FLUSH);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_flush(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::FullFlush);
 
         // Close should supersede the flush.
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Pending => {}
             other => panic!("expected Pending, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_CLOSED);
+        assert_eq!(ex.state, State::FullClosed);
 
         // Reader gets the data.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"data"),
             other => panic!("expected data, got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
     }
 
     // -----------------------------------------------------------------------
@@ -1070,7 +979,7 @@ mod tests {
 
     #[test]
     fn multiple_write_read_cycles() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
@@ -1079,12 +988,12 @@ mod tests {
         for i in 0u32..10 {
             let msg = format!("msg-{}", i);
             let mut payload = Bytes::from(msg.clone());
-            match IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload) {
+            match IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload) {
                 Poll::Ready(Ok(n)) => assert_eq!(n, msg.len()),
                 other => panic!("cycle {}: write failed: {:?}", i, other),
             }
 
-            match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+            match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
                 Poll::Ready(Ok(Some(data))) => assert_eq!(data, Bytes::from(msg)),
                 other => panic!("cycle {}: read failed: {:?}", i, other),
             }
@@ -1097,34 +1006,34 @@ mod tests {
 
     #[test]
     fn partial_reads_drain_slot_correctly() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"0123456789");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
 
         // Read 4 at a time.
-        match IoReader::con_poll_read(&ex, &mut rcx, 4) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 4) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"0123"),
             other => panic!("unexpected: {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        assert_eq!(ex.state, State::Full);
 
-        match IoReader::con_poll_read(&ex, &mut rcx, 4) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 4) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"4567"),
             other => panic!("unexpected: {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL);
+        assert_eq!(ex.state, State::Full);
 
         // Last 2 bytes — less than max_len, so slot becomes empty.
-        match IoReader::con_poll_read(&ex, &mut rcx, 4) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 4) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"89"),
             other => panic!("unexpected: {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY);
+        assert_eq!(ex.state, State::Empty);
     }
 
     // -----------------------------------------------------------------------
@@ -1133,87 +1042,79 @@ mod tests {
 
     #[test]
     fn partial_read_with_close_defers_done() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         let mut payload = Bytes::from_static(b"abcd");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_CLOSED);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::FullClosed);
 
         // Partial read — slot stays FULL_CLOSED because data remains.
-        match IoReader::con_poll_read(&ex, &mut rcx, 2) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 2) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"ab"),
             other => panic!("unexpected: {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_CLOSED);
+        assert_eq!(ex.state, State::FullClosed);
 
         // Drain the rest — now it should transition to DONE.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(Some(data))) => assert_eq!(&data[..], b"cd"),
             other => panic!("unexpected: {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
 
         // EOF.
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other),
         }
     }
 
     // -----------------------------------------------------------------------
-    // Reader pre-emptive wakeup on EOF
+    // Reader does NOT pre-wake on terminal EOF
     // -----------------------------------------------------------------------
 
     #[test]
-    fn eof_with_max_len_gt_zero_wakes_reader() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+    fn eof_with_max_len_gt_zero_does_not_wake_reader() {
+        let mut ex = IoBytesExchange::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
 
         rw.reset();
-        match IoReader::con_poll_read(&ex, &mut rcx, 1024) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
-        // The reader should pre-emptively wake itself for consumption
-        // requests on terminal states.
-        assert!(
-            rw.count() > 0,
-            "reader should self-wake on EOF consumption request"
-        );
+        // EOS is terminal and repeatable; the same call would just
+        // return the same value, so the caller must NOT be pre-woken.
+        assert_eq!(rw.count(), 0, "EOF must not pre-wake the reader");
     }
 
     #[test]
-    fn eof_with_max_len_zero_pre_wakes_reader() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+    fn eof_with_max_len_zero_does_not_wake_reader() {
+        let mut ex = IoBytesExchange::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
-        let _ = IoWriter::prod_poll_close(&ex, &mut wcx);
+        let _ = IoWriter::prod_poll_close(&mut ex, &mut wcx);
 
         rw.reset();
-        match IoReader::con_poll_read(&ex, &mut rcx, 0) {
+        match IoReader::con_poll_read(&mut ex, &mut rcx, 0) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
-        // con_poll* contract: each EOS return counts as consumption, so
-        // it pre-wakes even with max_len == 0.  The caller is responsible
-        // for recognising the signal and breaking out of its loop.
-        assert!(
-            rw.count() > 0,
-            "reader should self-wake on EOF regardless of max_len"
-        );
+        // EOS is terminal regardless of max_len.
+        assert_eq!(rw.count(), 0, "EOF must not pre-wake the reader");
     }
 
     // -----------------------------------------------------------------------
@@ -1222,40 +1123,40 @@ mod tests {
 
     #[test]
     fn close_on_empty_flush_goes_to_done() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
         // Get to EMPTY_FLUSH.
-        let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSH);
+        let _ = IoWriter::prod_poll_flush(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::EmptyFlush);
 
         // Close should transition directly to DONE.
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
     }
 
     #[test]
     fn close_on_empty_flushed_goes_to_done() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
         let (_, rw) = make_waker();
         let mut rcx = Context::from_waker(&rw);
 
         // Get to EMPTY_FLUSHED.
-        let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
-        let _ = IoReader::con_poll_read(&ex, &mut rcx, 1024);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_EMPTY_FLUSHED);
+        let _ = IoWriter::prod_poll_flush(&mut ex, &mut wcx);
+        let _ = IoReader::con_poll_read(&mut ex, &mut rcx, 1024);
+        assert_eq!(ex.state, State::EmptyFlushed);
 
-        match IoWriter::prod_poll_close(&ex, &mut wcx) {
+        match IoWriter::prod_poll_close(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ready(Ok(())), got {:?}", other),
         }
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DONE);
+        assert_eq!(ex.state, State::Done);
     }
 
     // -----------------------------------------------------------------------
@@ -1264,20 +1165,20 @@ mod tests {
 
     #[test]
     fn drop_read_during_flush() {
-        let ex = IoBytesExchange::<RawMutex>::new();
+        let mut ex = IoBytesExchange::new();
         let (_, ww) = make_waker();
         let mut wcx = Context::from_waker(&ww);
 
         let mut payload = Bytes::from_static(b"data");
-        let _ = IoWriter::prod_poll_write(&ex, &mut wcx, &mut payload);
-        let _ = IoWriter::prod_poll_flush(&ex, &mut wcx);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_FULL_FLUSH);
+        let _ = IoWriter::prod_poll_write(&mut ex, &mut wcx, &mut payload);
+        let _ = IoWriter::prod_poll_flush(&mut ex, &mut wcx);
+        assert_eq!(ex.state, State::FullFlush);
 
-        IoReader::drop_read(&ex);
-        assert_eq!(ex.state.load(Ordering::SeqCst), EXCH_DROPPED);
+        IoReader::drop_read(&mut ex);
+        assert_eq!(ex.state, State::Dropped);
 
         // Flush should now return Ok (terminal state).
-        match IoWriter::prod_poll_flush(&ex, &mut wcx) {
+        match IoWriter::prod_poll_flush(&mut ex, &mut wcx) {
             Poll::Ready(Ok(())) => {}
             other => panic!("expected Ok after drop, got {:?}", other),
         }
@@ -1289,20 +1190,22 @@ mod tests {
 
     #[tokio::test]
     async fn async_write_read_roundtrip() {
-        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
+        let ex = Arc::new(std::sync::Mutex::new(IoBytesExchange::new()));
 
         let writer_ex = ex.clone();
         let writer = tokio::spawn(async move {
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"async-hello");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_write(&mut *g, cx, &mut data)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_close(&mut *g, cx)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
@@ -1311,14 +1214,20 @@ mod tests {
 
         let reader_ex = ex.clone();
         let reader = tokio::spawn(async move {
-            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                .await
-                .unwrap();
+            let data = std::future::poll_fn(|cx| {
+                let mut g = reader_ex.lock().unwrap();
+                IoReader::con_poll_read(&mut *g, cx, 1024)
+            })
+            .await
+            .unwrap();
             assert_eq!(data.unwrap(), Bytes::from_static(b"async-hello"));
 
-            let eof = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                .await
-                .unwrap();
+            let eof = std::future::poll_fn(|cx| {
+                let mut g = reader_ex.lock().unwrap();
+                IoReader::con_poll_read(&mut *g, cx, 1024)
+            })
+            .await
+            .unwrap();
             assert!(eof.is_none(), "expected EOF");
         });
 
@@ -1328,7 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_multiple_chunks() {
-        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
+        let ex = Arc::new(std::sync::Mutex::new(IoBytesExchange::new()));
         let chunks: Vec<&[u8]> = vec![b"one", b"two", b"three"];
 
         let writer_ex = ex.clone();
@@ -1336,14 +1245,16 @@ mod tests {
             for chunk in &chunks {
                 std::future::poll_fn(|cx| {
                     let mut data = Bytes::from_static(chunk);
-                    IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                    let mut g = writer_ex.lock().unwrap();
+                    IoWriter::prod_poll_write(&mut *g, cx, &mut data)
                         .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
                 })
                 .await
                 .unwrap();
             }
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_close(&mut *g, cx)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
@@ -1354,10 +1265,12 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut received = Vec::new();
             loop {
-                let result =
-                    std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                        .await
-                        .unwrap();
+                let result = std::future::poll_fn(|cx| {
+                    let mut g = reader_ex.lock().unwrap();
+                    IoReader::con_poll_read(&mut *g, cx, 1024)
+                })
+                .await
+                .unwrap();
                 match result {
                     Some(data) => received.push(data),
                     None => break,
@@ -1373,14 +1286,15 @@ mod tests {
 
     #[tokio::test]
     async fn async_flush_handshake() {
-        let ex = Arc::new(IoBytesExchange::<RawMutex>::new());
+        let ex = Arc::new(std::sync::Mutex::new(IoBytesExchange::new()));
 
         let writer_ex = ex.clone();
         let writer = tokio::spawn(async move {
             // Send data.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"flush-test");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_write(&mut *g, cx, &mut data)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
@@ -1388,7 +1302,8 @@ mod tests {
 
             // Flush — blocks until reader acks.
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_flush(&*writer_ex, cx)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_flush(&mut *g, cx)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
@@ -1397,14 +1312,16 @@ mod tests {
             // Send more after flush.
             std::future::poll_fn(|cx| {
                 let mut data = Bytes::from_static(b"post-flush");
-                IoWriter::prod_poll_write(&*writer_ex, cx, &mut data)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_write(&mut *g, cx, &mut data)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
             .unwrap();
 
             std::future::poll_fn(|cx| {
-                IoWriter::prod_poll_close(&*writer_ex, cx)
+                let mut g = writer_ex.lock().unwrap();
+                IoWriter::prod_poll_close(&mut *g, cx)
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
             })
             .await
@@ -1414,23 +1331,32 @@ mod tests {
         let reader_ex = ex.clone();
         let reader = tokio::spawn(async move {
             // Read first chunk.
-            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                .await
-                .unwrap()
-                .unwrap();
+            let data = std::future::poll_fn(|cx| {
+                let mut g = reader_ex.lock().unwrap();
+                IoReader::con_poll_read(&mut *g, cx, 1024)
+            })
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(&data[..], b"flush-test");
 
             // Read second chunk (written after flush completed).
-            let data = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                .await
-                .unwrap()
-                .unwrap();
+            let data = std::future::poll_fn(|cx| {
+                let mut g = reader_ex.lock().unwrap();
+                IoReader::con_poll_read(&mut *g, cx, 1024)
+            })
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(&data[..], b"post-flush");
 
             // EOF.
-            let eof = std::future::poll_fn(|cx| IoReader::con_poll_read(&*reader_ex, cx, 1024))
-                .await
-                .unwrap();
+            let eof = std::future::poll_fn(|cx| {
+                let mut g = reader_ex.lock().unwrap();
+                IoReader::con_poll_read(&mut *g, cx, 1024)
+            })
+            .await
+            .unwrap();
             assert!(eof.is_none());
         });
 

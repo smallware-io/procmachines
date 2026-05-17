@@ -1,9 +1,9 @@
-//! Interior-mutable sink trait for async byte delivery.
+//! Single-producer sink trait for async byte delivery.
 //!
 //! This module defines [`IoWriter`], a single-producer polling trait for
-//! sending [`Bytes`] into an asynchronous byte stream.  Unlike
-//! `futures::AsyncWrite`, the trait uses interior mutability (`&self`
-//! receivers) and transfers data via [`Bytes`], avoiding copies when the
+//! sending [`Bytes`] into an asynchronous byte stream.  Like
+//! `futures::AsyncWrite`, the trait uses `&mut self` receivers, but it
+//! avoids `Pin` and transfers data via [`Bytes`], avoiding copies when the
 //! underlying buffer is reference-counted.
 
 use core::task::{Context, Poll};
@@ -12,24 +12,38 @@ use bytes::Bytes;
 
 /// A single-producer polling trait for sending bytes into an async stream.
 ///
-/// All methods take `&self` (interior mutability), so the writer and its
-/// paired reader can share a single allocation without splitting into
-/// separate handles.
+/// All methods take `&mut self`.  An implementation that also implements
+/// [`IoReader`](crate::io_reader::IoReader) on the same type (e.g.
+/// [`IoBytesExchange`](super::io_bytes_exchange::IoBytesExchange)) requires
+/// the caller to arrange exclusive access to each half — typically by
+/// wrapping the shared object in a lock or by splitting it into separate
+/// handles before handing the halves to producer and consumer tasks.
 ///
 /// # `prod_poll*` semantics
 ///
 /// The `prod_poll*` methods on this trait are intended for use by a single
 /// "producer" — a task that is producing bytes (or progress toward delivery)
-/// to be consumed downstream.  Each `prod_poll*` method behaves like
-/// [`Future::poll`]:
+/// to be consumed downstream.
 ///
-/// - If it returns [`Poll::Pending`], the calling task is registered to be
-///   woken later when the same call might return [`Poll::Ready`].
-/// - Unlike other kinds of `poll*` methods (e.g. `watch_poll*`), the calling
-///   task is **not** registered or pre-woken when a `prod_poll*` method
-///   returns [`Poll::Ready`].  A `Ready` return is simply a signal that the
-///   producer may proceed; it is the producer's responsibility to keep
-///   calling until something blocks.
+/// The unifying rule: **whenever a `prod_poll*` return indicates that
+/// transmission of the requested information to the receiver is not yet
+/// complete, the calling task is arranged to wake when more progress can
+/// be made.**
+///
+/// - If it returns [`Poll::Pending`], the calling task is registered to
+///   be woken later when the same call might return [`Poll::Ready`] —
+///   the standard `poll` contract.
+/// - If it returns [`Poll::Ready`] indicating **complete** transmission
+///   (e.g. all bytes accepted, a flush or close handshake acknowledged),
+///   the calling task is **not** pre-woken.  A `Ready` return is simply
+///   a signal that the producer may proceed.
+/// - If it returns [`Poll::Ready`] indicating **partial** progress (e.g.
+///   `prod_poll_write` returned a short count, leaving bytes unsent),
+///   the calling task is arranged to wake when more progress can be
+///   made.  Implementations should prefer registering the waker on the
+///   underlying blocking condition; if that is not feasible, they pre-wake
+///   the caller so the producer re-polls and either makes more progress
+///   or observes the blocking condition itself.
 ///
 /// Producers are expected to produce everything they can without blocking.
 /// Consequently, if no `prod_poll*` method ever returns [`Poll::Pending`],
@@ -53,7 +67,7 @@ pub trait IoWriter: Send {
     ///   number of bytes written (always > 0) is returned, and `bytes`
     ///   is advanced past the consumed portion.
     fn prod_poll_write(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         bytes: &mut Bytes,
     ) -> Poll<Result<usize, Self::Error>>;
@@ -67,7 +81,7 @@ pub trait IoWriter: Send {
     /// it has seen all sent data).
     ///
     /// Returns `Poll::Ready(Ok(()))` once the flush is acknowledged.
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn prod_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 
     /// Signals that no further bytes will be sent and waits for the close
     /// handshake to complete.
@@ -77,5 +91,5 @@ pub trait IoWriter: Send {
     /// consumes it.
     ///
     /// Returns `Poll::Ready(Ok(()))` once the close is fully acknowledged.
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+    fn prod_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }

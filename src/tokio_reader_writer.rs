@@ -32,8 +32,9 @@ use crate::IoWriter;
 ///   drops the inner reader.
 /// - Once the inner reader has been dropped (either by reaching EOF / error,
 ///   or by an explicit [`drop_read`](IoReader::drop_read)), `con_poll_read`
-///   is in the EOF condition: it returns `Ready(Ok(None))` and pre-wakes the
-///   caller per the `con_poll*` contract.  The signal is repeatable.
+///   is in the EOF condition: it returns `Ready(Ok(None))`.  The signal is
+///   terminal and repeatable; per the `con_poll*` contract, the caller is
+///   not pre-woken.
 /// - [`drop_read`](IoReader::drop_read) drops the inner reader and discards
 ///   any buffered data and pending error.
 ///
@@ -86,15 +87,14 @@ where
     type Error = IoError;
 
     fn con_poll_read(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<Result<Option<Bytes>, IoError>> {
         let mut inner = self.inner.borrow_mut();
         if inner.reader.is_none() {
-            // Already in EOF state; one repetition of the EOS signal is
-            // consumed and the caller is pre-woken.
-            cx.waker().wake_by_ref();
+            // Already in terminal EOF state — repeatable, per the
+            // con_poll* contract we do not pre-wake.
             return Poll::Ready(Ok(None));
         };
         // attempt to read more data, if it's appropriate to do so.
@@ -142,13 +142,18 @@ where
                 // No data, but not EOF yet; we must be pending on the reader or the buf provider.  Don't pre-wake, just return Pending.
                 return Poll::Pending;
             }
-            // EOF condition
-            cx.waker().wake_by_ref();
+            // EOF condition.
             inner.reader = None;
             let err = inner.got_eof.take().unwrap_or(None);
             return match err {
+                // Terminal EOS — repeatable, no pre-wake.
                 None => Poll::Ready(Ok(None)),
-                Some(e) => Poll::Ready(Err(e)),
+                // One-shot error; the next call returns plain EOS, so
+                // this Ready does represent a state change — pre-wake.
+                Some(e) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Ready(Err(e))
+                }
             };
         }
         // We have data
@@ -156,14 +161,14 @@ where
             // Caller was just checking.  Not a consumption, so don't pre-wake, but return the empty probe result.
             return Poll::Ready(Ok(Some(Bytes::new())));
         }
-        // no matter what now, we're going to consume data or eof or error, so pre-wake the caller.
+        // Data consumed; pre-wake the caller to drain more.
         cx.waker().wake_by_ref();
         Poll::Ready(Ok(Some(
             inner.cur_buf.split_to(min(max_len, have_len)).freeze(),
         )))
     }
 
-    fn drop_read(&self) {
+    fn drop_read(&mut self) {
         let mut inner = self.inner.borrow_mut();
         inner.reader = None;
         inner.got_eof = None;
@@ -200,30 +205,38 @@ where
     type Error = IoError;
 
     fn prod_poll_write(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         bytes: &mut Bytes,
     ) -> Poll<Result<usize, Self::Error>> {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        let requested = bytes.len();
         let mut inner = self.inner.borrow_mut();
         match Pin::new(&mut *inner).poll_write(cx, bytes.as_ref()) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
             Poll::Ready(Ok(sz)) => {
                 let _ = bytes.split_to(sz);
+                // Partial write: per the prod_poll* contract, the
+                // tokio writer did not register our waker (it returned
+                // Ready), so pre-wake the caller to drive transmission
+                // of the remainder.
+                if sz < requested {
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Ready(Ok(sz))
             }
         }
     }
 
-    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn prod_poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
         Pin::new(&mut *inner).poll_flush(cx).map_err(Into::into)
     }
 
-    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn prod_poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
         Pin::new(&mut *inner).poll_shutdown(cx).map_err(Into::into)
     }
@@ -475,14 +488,15 @@ mod tests {
     // =======================================================================
 
     // -----------------------------------------------------------------------
-    // After drop_read, the reader is at EOF and the signal is repeatable.
+    // After drop_read, the reader is at EOF.  EOF is terminal and
+    // repeatable, so it must NOT pre-wake the caller.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn reader_dropped_returns_eof_and_pre_wakes() {
+    fn reader_dropped_returns_eof_without_pre_wake() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         r.drop_read();
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
@@ -491,15 +505,16 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected Ready(Ok(None)), got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake the caller");
+        assert_eq!(cw.count(), 0, "EOF must not pre-wake the caller");
 
-        // EOF is repeatable.
+        // EOF is repeatable — same call still returns Ok(None) and still
+        // does not pre-wake.
         cw.reset();
         match r.con_poll_read(&mut cx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected repeated EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "repeated EOF must also pre-wake");
+        assert_eq!(cw.count(), 0, "repeated EOF must not pre-wake");
     }
 
     // -----------------------------------------------------------------------
@@ -510,7 +525,7 @@ mod tests {
     fn reader_returns_data_then_eof() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"hello".to_vec()), ReadAction::Eof]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -525,7 +540,7 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake");
+        assert_eq!(cw.count(), 0, "EOF must not pre-wake");
     }
 
     // -----------------------------------------------------------------------
@@ -539,7 +554,7 @@ mod tests {
             ReadAction::Data(b"abcdefghij".to_vec()),
             ReadAction::Eof,
         ]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -571,7 +586,7 @@ mod tests {
     fn reader_propagates_pending() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Pending]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -597,7 +612,7 @@ mod tests {
             ReadAction::Data(b"hello".to_vec()),
             ReadAction::Err(io::ErrorKind::ConnectionReset),
         ]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -630,7 +645,7 @@ mod tests {
     fn reader_zero_probe_with_data_is_some_empty_no_prewake() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"xy".to_vec()), ReadAction::Eof]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -648,7 +663,7 @@ mod tests {
             ReadAction::Data(b"abcdef".to_vec()),
             ReadAction::Pending,
         ]);
-        let r2 = ReaderIoReader::new(inner2, bp2);
+        let mut r2 = ReaderIoReader::new(inner2, bp2);
 
         // First read: cap at 3 so 3 bytes remain in the buffer.
         match r2.con_poll_read(&mut cx, 3) {
@@ -671,12 +686,12 @@ mod tests {
     }
 
     #[test]
-    fn reader_zero_probe_eof_is_none_and_pre_wakes() {
-        // EOF probe with max_len == 0: per the trait contract, the EOS
-        // signal still counts as consumption and pre-wakes the caller.
+    fn reader_zero_probe_eof_is_none_no_pre_wake() {
+        // EOF probe with max_len == 0: EOS is terminal and repeatable,
+        // so the caller is not pre-woken.
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         r.drop_read();
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
@@ -685,7 +700,7 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake even on max_len==0 probe");
+        assert_eq!(cw.count(), 0, "EOF must not pre-wake");
     }
 
     // -----------------------------------------------------------------------
@@ -696,7 +711,7 @@ mod tests {
     fn reader_drop_read_enters_eof() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![ReadAction::Data(b"unread".to_vec())]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -716,7 +731,7 @@ mod tests {
     fn reader_buf_provider_pending_propagates() {
         let bp = MockBufProvider::scripted(vec![BufAction::Pending], 64);
         let inner = MockReader::new(vec![ReadAction::Data(b"x".to_vec())]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -735,7 +750,7 @@ mod tests {
     fn reader_zero_capacity_buf_returns_oom() {
         let bp = MockBufProvider::scripted(vec![BufAction::Buf(BytesMut::with_capacity(0))], 0);
         let inner = MockReader::new(vec![ReadAction::Data(b"x".to_vec())]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -758,7 +773,7 @@ mod tests {
             ReadAction::Data(b"cc".to_vec()),
             ReadAction::Eof,
         ]);
-        let r = ReaderIoReader::new(inner, bp);
+        let mut r = ReaderIoReader::new(inner, bp);
         let (_cw, w) = make_waker();
         let mut cx = Context::from_waker(&w);
 
@@ -783,7 +798,7 @@ mod tests {
 
     #[test]
     fn writer_empty_write_is_noop() {
-        let w = WriterIoWriter::new(MockWriter::new());
+        let mut w = WriterIoWriter::new(MockWriter::new());
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -802,7 +817,7 @@ mod tests {
     fn writer_writes_full_buffer() {
         let mw = MockWriter::new();
         let written = mw.written_handle();
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -823,8 +838,8 @@ mod tests {
     fn writer_partial_write_advances_payload() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Wrote(2)]);
         let written = mw.written_handle();
-        let w = WriterIoWriter::new(mw);
-        let (_cw, waker) = make_waker();
+        let mut w = WriterIoWriter::new(mw);
+        let (cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
         let mut payload = Bytes::from_static(b"abcdef");
@@ -834,6 +849,9 @@ mod tests {
         }
         assert_eq!(&payload[..], b"cdef");
         assert_eq!(&written.lock().unwrap()[..], b"ab");
+        // Partial write must pre-wake so the producer re-polls and
+        // drives the remainder.
+        assert!(cw.count() > 0, "partial write must pre-wake the caller");
     }
 
     // -----------------------------------------------------------------------
@@ -843,7 +861,7 @@ mod tests {
     #[test]
     fn writer_pending_leaves_payload_untouched() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Pending]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -863,7 +881,7 @@ mod tests {
     #[test]
     fn writer_propagates_error() {
         let mw = MockWriter::new().with_writes(vec![WriteAction::Err(io::ErrorKind::Other)]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -887,7 +905,7 @@ mod tests {
             FlushAction::Ok,
             FlushAction::Err(io::ErrorKind::WriteZero),
         ]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -907,7 +925,7 @@ mod tests {
     #[test]
     fn writer_close_pending_keeps_inner() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Pending]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -929,7 +947,7 @@ mod tests {
     #[test]
     fn writer_close_ok() {
         let mw = MockWriter::new().with_shutdowns(vec![ShutdownAction::Ok]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -944,7 +962,7 @@ mod tests {
     fn writer_close_error_propagates() {
         let mw = MockWriter::new()
             .with_shutdowns(vec![ShutdownAction::Err(io::ErrorKind::ConnectionAborted)]);
-        let w = WriterIoWriter::new(mw);
+        let mut w = WriterIoWriter::new(mw);
         let (_cw, waker) = make_waker();
         let mut cx = Context::from_waker(&waker);
 

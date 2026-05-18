@@ -27,19 +27,23 @@
 //!
 //! - The `state` field (`AtomicU8`) is the sequencing authority; all
 //!   transitions use `SeqCst` compare-exchanges.
-//! - The `item` field (`Mutex<Option<ITEM>>`) protects the payload.
-//!   The mutex is held during the brief window of placing/taking the item
+//! - The `item` field (`RefCell<Option<ITEM>>`) protects the payload.
+//!   The borrow is held during the brief window of placing/taking the item
 //!   so that the state transition and the payload swap are atomic together.
-//! - `AtomicWaker`s for both sides ensure the other side is notified when
+//! - `WakerRef`s for both sides ensure the other side is notified when
 //!   it can make progress.
+//!
+//! The exchange uses non-atomic interior mutability (`RefCell`, `WakerRef`),
+//! so it is `Send` but not `Sync` — it may be moved between threads but
+//! must not be accessed concurrently from multiple threads.
 
 use core::{
+    cell::RefCell,
     sync::atomic::{AtomicU8, Ordering},
     task::{Context, Poll},
 };
-use futures::task::AtomicWaker;
-use lock_api::{Mutex, RawMutex};
 
+use crate::waker_ref::WakerRef;
 use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 
 /// A single-slot, lock-assisted rendezvous channel.
@@ -55,18 +59,18 @@ use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 /// [`IoSink`] / [`IoStream`] methods to send and receive items, while
 /// external code interacts through the [`IoGuard`](crate::IoGuard).
 #[derive(Debug)]
-pub struct IoExchange<R: RawMutex, ITEM> {
+pub struct IoExchange<ITEM> {
     /// Waker for the reader side, notified when an item is placed or the
     /// stream is closed.
-    reader: AtomicWaker,
+    reader: WakerRef,
     /// Waker for the writer side, notified when the reader consumes the
     /// item (freeing the slot) or drops.
-    writer: AtomicWaker,
+    writer: WakerRef,
     /// Atomic state machine governing the exchange lifecycle.
     state: AtomicU8,
-    /// The single-item payload slot, protected by a mutex so that state
+    /// The single-item payload slot, behind a `RefCell` so that state
     /// transitions and payload swaps happen together.
-    item: Mutex<R, Option<ITEM>>,
+    item: RefCell<Option<ITEM>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,20 +96,20 @@ const EXCH_DONE: u8 = 6;
 /// The reader has been dropped; further writes will error.
 const EXCH_DROPPED: u8 = 7;
 
-impl<R: RawMutex, ITEM> Default for IoExchange<R, ITEM> {
+impl<ITEM> Default for IoExchange<ITEM> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R: RawMutex, ITEM> IoExchange<R, ITEM> {
+impl<ITEM> IoExchange<ITEM> {
     /// Creates a new, empty exchange in the `EMPTY` state.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            reader: AtomicWaker::new(),
-            writer: AtomicWaker::new(),
+            reader: WakerRef::new(),
+            writer: WakerRef::new(),
             state: AtomicU8::new(EXCH_EMPTY),
-            item: Mutex::new(None),
+            item: RefCell::new(None),
         }
     }
 
@@ -113,7 +117,7 @@ impl<R: RawMutex, ITEM> IoExchange<R, ITEM> {
     /// in-flight item and waking any registered reader or writer so they
     /// re-poll and observe the fresh state.
     pub fn reset(&self) {
-        let mut guard = self.item.lock();
+        let mut guard = self.item.borrow_mut();
         self.state.store(EXCH_EMPTY, Ordering::SeqCst);
         *guard = None;
         drop(guard);
@@ -126,7 +130,7 @@ impl<R: RawMutex, ITEM> IoExchange<R, ITEM> {
 // IoStream (reader side)
 // ---------------------------------------------------------------------------
 
-impl<R: RawMutex, ITEM> IoStream for IoExchange<R, ITEM> {
+impl<ITEM> IoStream for IoExchange<ITEM> {
     type Item = ITEM;
     type Error = IoError;
 
@@ -137,7 +141,7 @@ impl<R: RawMutex, ITEM> IoStream for IoExchange<R, ITEM> {
     /// - `FULL_FLUSH` → `EMPTY_FLUSH` (item consumed, flush still pending)
     /// - `FULL_CLOSED` → `DONE` (last item consumed, stream ends)
     fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<ITEM>, Self::Error>> {
-        let mut guard = self.item.lock();
+        let mut guard = self.item.borrow_mut();
         let st = self.state.load(Ordering::Acquire);
         let nextst = match st {
             EXCH_EMPTY_FLUSHED => {
@@ -203,7 +207,7 @@ impl<R: RawMutex, ITEM> IoStream for IoExchange<R, ITEM> {
     }
 
     fn drop_read(&self) {
-        let mut guard = self.item.lock();
+        let mut guard = self.item.borrow_mut();
         let st = self.state.load(Ordering::Acquire);
         match st {
             EXCH_DROPPED | EXCH_DONE => (),
@@ -221,7 +225,7 @@ impl<R: RawMutex, ITEM> IoStream for IoExchange<R, ITEM> {
 // IoSink (writer side)
 // ---------------------------------------------------------------------------
 
-impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
+impl<ITEM> IoSink<ITEM> for IoExchange<ITEM> {
     type Error = IoError;
 
     /// Checks whether the slot is empty and ready to accept a new item.
@@ -256,7 +260,7 @@ impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
         if item.is_none() {
             return Poll::Ready(Ok(()));
         }
-        let mut guard = self.item.lock();
+        let mut guard = self.item.borrow_mut();
         let st = self.state.load(Ordering::Acquire);
         match st {
             EXCH_EMPTY | EXCH_EMPTY_FLUSH | EXCH_EMPTY_FLUSHED => {
@@ -327,9 +331,9 @@ impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
             // Item still in flight — mark as flush-pending.
             EXCH_FULL => {
                 self.writer.register(cx.waker());
-                // Hold the lock to prevent the reader from consuming the
+                // Hold the borrow to prevent the reader from consuming the
                 // item between our load and our CAS.
-                let _guard = self.item.lock();
+                let _guard = self.item.borrow_mut();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_FLUSH, Ordering::SeqCst, Ordering::SeqCst)
@@ -375,9 +379,9 @@ impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
             // Item in flight — mark as "last item, then close".
             EXCH_FULL | EXCH_FULL_FLUSH => {
                 self.writer.register(cx.waker());
-                // Hold the lock to prevent the reader from consuming the
+                // Hold the borrow to prevent the reader from consuming the
                 // item between our load and our CAS.
-                let _guard = self.item.lock();
+                let _guard = self.item.borrow_mut();
                 if self
                     .state
                     .compare_exchange(st, EXCH_FULL_CLOSED, Ordering::SeqCst, Ordering::SeqCst)
@@ -408,11 +412,10 @@ impl<R: RawMutex, ITEM> IoSink<ITEM> for IoExchange<R, ITEM> {
 mod tests {
     use super::*;
     use futures::task::noop_waker;
-    use parking_lot::RawMutex;
     use std::sync::atomic::Ordering as AtomicOrdering;
     use std::task::Context;
 
-    type TestExchange = IoExchange<RawMutex, u64>;
+    type TestExchange = IoExchange<u64>;
 
     /// Helper: run a closure with a no-op waker context.
     fn with_noop_cx<T>(f: impl FnOnce(&mut Context<'_>) -> T) -> T {

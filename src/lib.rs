@@ -15,6 +15,7 @@ pub mod io_writer;
 pub mod proc_machines;
 #[cfg(feature = "tokio")]
 pub mod tokio_reader_writer;
+pub mod waker_ref;
 pub mod watchable_value;
 
 pub use alarm_clock::*;
@@ -30,4 +31,5 @@ pub use io_writer::*;
 pub use proc_machines::*;
 #[cfg(feature = "tokio")]
 pub use tokio_reader_writer::*;
+pub use waker_ref::*;
 pub use watchable_value::*;

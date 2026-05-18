@@ -753,7 +753,7 @@ pub trait MultiWake: Send + Sync {
 /// [`TransparentWrapperAlloc::wrap_arc`].
 #[derive(TransparentWrapper)]
 #[repr(transparent)]
-struct MultiwakeWrapper<T: MultiWake, const N: u8>(T);
+struct MultiwakeWrapper<T: MultiWake + ?Sized, const N: u8>(T);
 
 impl<T, const N: u8> Wake for MultiwakeWrapper<T, N>
 where

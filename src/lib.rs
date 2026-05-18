@@ -12,6 +12,7 @@ pub mod io_reader;
 pub mod io_sink;
 pub mod io_stream;
 pub mod io_writer;
+pub mod mut_lockable;
 pub mod proc_machines;
 #[cfg(feature = "tokio")]
 pub mod tokio_reader_writer;
@@ -28,6 +29,7 @@ pub use io_reader::*;
 pub use io_sink::*;
 pub use io_stream::*;
 pub use io_writer::*;
+pub use mut_lockable::*;
 pub use proc_machines::*;
 #[cfg(feature = "tokio")]
 pub use tokio_reader_writer::*;

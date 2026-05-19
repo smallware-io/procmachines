@@ -22,33 +22,6 @@
 //! - **External clock.** Timeouts use an [`AlarmClock`](crate::alarm_clock::AlarmClock)
 //!   advanced by the caller, making the protocol testable without real time.
 //!
-//! # Architecture
-//!
-//! ```text
-//!  External code               ProcMachine (behind Arc)
-//! ┌────────────┐      lock()  ┌──────────────────────────────┐
-//! │            │─────────────►│  Mutex<ProcMachineInner>     │
-//! │            │  IoGuard     │  ┌────────────────────────┐  │
-//! │ reads/writes◄────────────►│  │ IO struct              │  │
-//! │ to IO      │  Deref       │  ├────────────────────────┤  │
-//! │            │              │  │ Future 1 (task A)      │  │
-//! │            │◄─────────────│  │ Future 2 (task B)      │  │
-//! │            │  drop guard  │  │ ...                    │  │
-//! │            │  → tick()    │  │ alive_mask: u32        │  │
-//! └────────────┘              │  └────────────────────────┘  │
-//!                             │  wake_mask: AtomicU32        │
-//!                             └──────────────────────────────┘
-//! ```
-//!
-//! 1. External code calls [`LockableIo::lock`] to obtain an [`IoGuard`].
-//! 2. Through the guard it reads/writes the IO struct (e.g. feeding data
-//!    into an [`IoExchange`](crate::io_exchange::IoExchange)).
-//! 3. When the guard is dropped, the machine's internal unlock path runs a
-//!    `tick`, which polls every task whose waker has fired since the last
-//!    tick.
-//! 4. Tasks run until they all return `Pending`, then control returns to the
-//!    caller.
-//!
 //! # Wake mechanism
 //!
 //! Each task gets its own [`Waker`] via the [multi-waker system](#multi-waker-support).
@@ -87,6 +60,8 @@ use lock_api::{Mutex, RawMutex};
 #[cfg(feature = "std")]
 use std::{sync::Arc, task::Wake};
 
+use crate::{MutLockable, RefLockable};
+
 // ============================================================================
 // PUBLIC INTERFACE
 // ============================================================================
@@ -98,11 +73,13 @@ use std::{sync::Arc, task::Wake};
 /// advance automatically when the lock is released.
 ///
 /// Callers work with `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachine<IO: ?Sized>: core::fmt::Debug + Send + Sync {
+pub trait ProcMachine: core::fmt::Debug + Send + Sync {
+    type IO;
+
     /// Returns `true` when every internal task has completed.
     ///
     /// Also ticks the machine, so any pending wakes are processed first.
-    fn is_done(self: Pin<&Self>) -> bool;
+    fn is_done(&self) -> bool;
 
     /// Check for external wakes to the internal jobs.
     ///
@@ -119,19 +96,17 @@ pub trait ProcMachine<IO: ?Sized>: core::fmt::Debug + Send + Sync {
     ///
     /// It is only necessary to call this method if the internal tasks could poll
     /// something "external", that can signal outside of `lock()`
-    fn poll_external(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()>;
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()>;
 
-    /// Acquires the inner mutex and returns a raw pointer to the IO struct.
+    /// Acquires the inner mutex and returns a mutable ref to the IO struct.
     ///
     /// # Safety
     ///
-    /// - `&self` must be pinned by an `Arc` (guaranteed by the machine's
-    ///   constructor).
     /// - The caller **must** call [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)
     ///   exactly once after the critical section, and must not use the
     ///   returned pointer after that call.
     #[allow(clippy::mut_from_ref)]
-    unsafe fn unsafe_lock_io(self: Pin<&Self>) -> Pin<&mut IO>;
+    unsafe fn unsafe_lock_io(&self) -> &mut Self::IO;
 
     /// Ticks the machine and releases the inner mutex.
     ///
@@ -141,101 +116,87 @@ pub trait ProcMachine<IO: ?Sized>: core::fmt::Debug + Send + Sync {
     ///   [`unsafe_lock_io`](ProcMachine::unsafe_lock_io).
     /// - No references derived from the pointer returned by `unsafe_lock_io`
     ///   may be used after this call.
-    unsafe fn unsafe_unlock_io(self: Pin<&Self>);
+    unsafe fn unsafe_unlock_io(&self);
 }
 
-pub trait IoGuard<'a, IO: ?Sized>: Deref<Target = IO> + DerefMut<Target = IO> {
-    fn get_pin(&'a self) -> Pin<&'a IO>;
-}
-
-/// Extension trait on `Arc<dyn ProcMachine<IO>>` providing safe lock access.
-pub trait ProcMachineHolder<IO: ?Sized> {
-    type Guard<'a>: IoGuard<'a, IO>
-    where
-        Self: 'a;
-    /// Locks the machine and returns an [`IoGuard`] that derefs to the IO
-    /// struct. When the guard is dropped the machine ticks.
-    fn lock<'a>(&'a self) -> Self::Guard<'a>;
-    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>>;
-}
-
-impl<IO> ProcMachineHolder<IO> for Arc<dyn ProcMachine<IO>>
+pub struct ProcMachineRefGuard<'a, T>
 where
-    IO: 'static + Send + ?Sized,
+    T: ProcMachine + ?Sized,
 {
-    type Guard<'a> = IoArcGuard<'a, IO>;
-    #[inline(always)]
-    fn lock<'a>(&'a self) -> Self::Guard<'a> {
-        IoArcGuard::new(self.clone())
-    }
-
-    fn get_pin(&self) -> Pin<&dyn ProcMachine<IO>> {
-        unsafe { Pin::new_unchecked(self.as_ref()) }
-    }
+    inner: &'a T,
+    r: &'a mut T::IO,
 }
 
-/// RAII guard providing `&IO` / `&mut IO` access to a locked [`ProcMachine`].
-///
-/// Created by [`LockableIo::lock`]. Dropping the guard calls
-/// [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io), which ticks the
-/// machine (polling any tasks whose wakers fired during the critical
-/// section).
-///
-/// The guard is `!Send` because `ptr` is a raw pointer, which is correct —
-/// a mutex guard should not be sent to another thread.
-pub struct IoArcGuard<'a, IO: 'static + Send + ?Sized> {
-    holder: Arc<dyn ProcMachine<IO>>,
-    ptr: Pin<&'a mut IO>,
-}
-
-impl<'a, IO: Send + ?Sized> IoGuard<'a, IO> for IoArcGuard<'a, IO> {
-    fn get_pin(&'a self) -> Pin<&'a IO> {
-        self.ptr.as_ref()
-    }
-}
-
-impl<'a, IO: Send + ?Sized> IoArcGuard<'a, IO> {
-    /// Acquires the lock and creates a new guard.
-    pub fn new(holder: Arc<dyn ProcMachine<IO>>) -> Self {
-        let ptr = unsafe {
-            let p: *const dyn ProcMachine<IO> = holder.as_ref();
-            Pin::new_unchecked(&*p).unsafe_lock_io()
-        };
-        Self { holder, ptr }
-    }
-}
-
-impl<'a, IO> Drop for IoArcGuard<'a, IO>
+impl<'a, T> ProcMachineRefGuard<'a, T>
 where
-    IO: 'static + Send + ?Sized,
+    T: ProcMachine + ?Sized,
 {
-    /// Ticks the machine and releases the lock.
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            self.holder.get_pin().unsafe_unlock_io();
+    fn new(inner: &'a T) -> Self {
+        Self {
+            inner,
+            r: unsafe { inner.unsafe_lock_io() },
         }
     }
 }
 
-impl<'a, IO> Deref for IoArcGuard<'a, IO>
+impl<'a, T> Drop for ProcMachineRefGuard<'a, T>
 where
-    IO: Send + ?Sized,
+    T: ProcMachine + ?Sized,
 {
-    type Target = IO;
-    #[inline]
-    fn deref(&self) -> &IO {
-        &self.ptr
+    fn drop(&mut self) {
+        unsafe {
+            self.inner.unsafe_unlock_io();
+        }
     }
 }
 
-impl<'a, IO> DerefMut for IoArcGuard<'a, IO>
+impl<'a, T> Deref for ProcMachineRefGuard<'a, T>
 where
-    IO: Send + ?Sized,
+    T: ProcMachine + ?Sized,
 {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut IO {
-        unsafe { Pin::as_mut(&mut self.ptr).get_unchecked_mut() }
+    type Target = T::IO;
+
+    fn deref(&self) -> &Self::Target {
+        self.r
+    }
+}
+
+impl<'a, T> DerefMut for ProcMachineRefGuard<'a, T>
+where
+    T: ProcMachine + ?Sized,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.r
+    }
+}
+
+impl<T> RefLockable for T
+where
+    T: ProcMachine + ?Sized,
+{
+    type Target = T::IO;
+    type Guard<'a>
+        = ProcMachineRefGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock_ref<'a>(&'a self) -> Self::Guard<'a> {
+        Self::Guard::new(self)
+    }
+}
+
+impl<T> MutLockable for T
+where
+    T: ProcMachine + ?Sized,
+{
+    type Target = T::IO;
+    type Guard<'a>
+        = ProcMachineRefGuard<'a, T>
+    where
+        Self: 'a;
+
+    fn lock_mut<'a>(&'a self) -> Self::Guard<'a> {
+        Self::Guard::new(self)
     }
 }
 
@@ -406,7 +367,7 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
     ) -> impl ProcMachineJobs<IO>;
 
     /// Consumes the builder, allocates the ProcMachine, and returns it.
-    fn build<R: RawMutex + 'static>(self, io: IO) -> Arc<dyn ProcMachine<IO>>
+    fn build<R: RawMutex + 'static>(self, io: IO) -> Arc<ProcMachineImpl<R, IO, Self::FUTURES>>
     where
         Self: Sized + 'static,
     {
@@ -479,7 +440,7 @@ impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> 
 
 /// The mutex-protected interior: IO + futures + alive tracking.
 #[derive(Debug)]
-struct ProcMachineInner<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> {
+struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
     futures: FUTURES,
     /// Bitmask of tasks that have not yet completed. Bit `n` corresponds to
     /// the task at depth `n`. Updated after every `poll` call.
@@ -497,7 +458,7 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
     }
 }
 
-impl<IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
     /// Repeatedly polls tasks until no more wakes are pending.
     ///
     /// Each iteration atomically swaps `wake_mask` to 0 (claiming all
@@ -553,11 +514,7 @@ pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
 /// `unsafe impl Send + Sync`. This is sound because `raw_arc` is
 /// immutable after construction and always points to the Arc's own
 /// allocation, which is guaranteed to be alive while any `&self` exists.
-struct ProcMachineImpl<
-    R: RawMutex,
-    IO: Send + Debug + ?Sized,
-    FUTURES: ProcMachineFutures + 'static,
-> {
+pub struct ProcMachineImpl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
     wake_mask: AtomicU32,
     external_waker: AtomicWaker,
     raw_arc: *const Self,
@@ -567,16 +524,16 @@ struct ProcMachineImpl<
 // SAFETY: All mutable state is behind the Mutex or is AtomicU32.
 // raw_arc is immutable after construction and points to the Arc's own
 // allocation (which is alive while any reference exists).
-unsafe impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Send
+unsafe impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Send
     for ProcMachineImpl<R, IO, FUTURES>
 {
 }
-unsafe impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> Sync
+unsafe impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Sync
     for ProcMachineImpl<R, IO, FUTURES>
 {
 }
 
-impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::fmt::Debug
+impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
     for ProcMachineImpl<R, IO, FUTURES>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -594,7 +551,7 @@ impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures> core::
 /// the mutex is held (e.g. a task writes to an IoExchange, which wakes
 /// the reader's waker synchronously). Because `wake_mask` is atomic and
 /// lives outside the mutex, this never deadlocks.
-impl<R: RawMutex, IO: Send + Debug + ?Sized, FUTURES: ProcMachineFutures + 'static> MultiWake
+impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
     for ProcMachineImpl<R, IO, FUTURES>
 {
     fn wake(&self, n: u8) {
@@ -668,9 +625,10 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
 }
 
 impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
-    ProcMachine<IO> for ProcMachineImpl<R, IO, FUTURES>
+    ProcMachine for ProcMachineImpl<R, IO, FUTURES>
 {
-    fn is_done(self: Pin<&Self>) -> bool {
+    type IO = IO;
+    fn is_done(&self) -> bool {
         // Reconstruct a temporary Arc<Self> for tick(). The
         // increment_strong_count / from_raw pair ensures the ref count
         // nets to zero when the temporary is dropped at the end.
@@ -682,15 +640,15 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
         !guard.tick(&arc, &self.wake_mask)
     }
 
-    unsafe fn unsafe_lock_io(self: Pin<&Self>) -> Pin<&mut IO> {
+    unsafe fn unsafe_lock_io(&self) -> &mut IO {
         // Acquire the raw mutex (not through MutexGuard, because we need
         // to release it in a separate call — unsafe_unlock_io).
         unsafe { self.inner.raw().lock() };
         let inner_ptr = self.inner.data_ptr();
-        unsafe { Pin::new_unchecked(&mut (*inner_ptr).io) }
+        unsafe { &mut (*inner_ptr).io }
     }
 
-    unsafe fn unsafe_unlock_io(self: Pin<&Self>) {
+    unsafe fn unsafe_unlock_io(&self) {
         // Reconstruct a temporary Arc for tick (same pattern as is_done).
         let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);
@@ -706,7 +664,7 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
         };
     }
 
-    fn poll_external(self: Pin<&Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.external_waker.register(cx.waker());
         if (self.wake_mask.load(Ordering::Relaxed) & 0x7FFFFFFF) != 0 {
             unsafe {
@@ -850,6 +808,10 @@ mod tests {
     // opens the gate and wakes the stored waker — the next poll sees the
     // open gate and returns Ready, allowing the task to proceed.
 
+    trait DynTestIO {
+        fn inc(&self);
+    }
+
     /// Minimal IO struct for testing ProcMachine task scheduling.
     #[derive(Debug)]
     struct TestIO {
@@ -861,6 +823,15 @@ mod tests {
         /// mutex (accessed through Pin<&TestIO>, which is only valid
         /// while the mutex is held).
         slots: std::sync::Mutex<Vec<Slot>>,
+    }
+
+    impl<T> DynTestIO for T
+    where
+        T: ProcMachine<IO = TestIO>,
+    {
+        fn inc(&self) {
+            self.lock_ref().counter.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Per-task suspend/resume state.
@@ -978,17 +949,18 @@ mod tests {
 
     #[test]
     fn build_single_task_machine() {
-        let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
+        let _machine: Arc<dyn ProcMachine<IO = TestIO>> = PROC_MACHINE_JOBS_BASE
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
     }
 
     #[test]
     fn build_two_task_machine() {
-        let _machine: Arc<dyn ProcMachine<TestIO>> = PROC_MACHINE_JOBS_BASE
+        let machine: Arc<dyn DynTestIO + Send + Sync> = PROC_MACHINE_JOBS_BASE
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
+        machine.inc();
     }
 
     #[test]
@@ -997,7 +969,7 @@ mod tests {
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
-        let guard = machine.lock();
+        let guard = machine.lock_ref();
         assert_eq!(guard.counter(), 1);
         assert_eq!(guard.completed(), 1);
     }
@@ -1008,7 +980,7 @@ mod tests {
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1022,11 +994,11 @@ mod tests {
             .build::<RawMutex>(TestIO::new(1));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 1); // first half ran
             assert_eq!(guard.completed(), 0);
         }
-        assert!(!machine.get_pin().is_done());
+        assert!(!machine.is_done());
     }
 
     #[test]
@@ -1037,18 +1009,18 @@ mod tests {
 
         // Open the gate and wake the task.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 1);
             guard.open_gate(0);
         }
         // Guard drop → tick → task sees open gate → resumes.
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 2);
             assert_eq!(guard.completed(), 1);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     #[test]
@@ -1059,28 +1031,28 @@ mod tests {
 
         // Initial: first increment + suspend.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 1);
         }
 
         // Resume 3 times (the task loops 3 times with a suspend each).
         for expected in [2, 3, 4] {
             {
-                let guard = machine.lock();
+                let guard = machine.lock_ref();
                 guard.open_gate(0);
             }
             {
-                let guard = machine.lock();
+                let guard = machine.lock_mut();
                 assert_eq!(guard.counter(), expected);
             }
         }
 
         // After 3 resumes, the loop ends and the task completes.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.completed(), 1);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1096,33 +1068,33 @@ mod tests {
 
         // Both tasks ran their first half: 1 + 10 = 11.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_mut();
             assert_eq!(guard.counter(), 11);
             assert_eq!(guard.completed(), 0);
         }
 
         // Wake only task 0.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(0);
         }
         {
-            let guard = machine.lock();
+            let guard = machine.lock_mut();
             assert_eq!(guard.counter(), 12); // +1 from task 0
             assert_eq!(guard.completed(), 1); // only task 0 done
         }
 
         // Wake task 1.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(1);
         }
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 22); // +10 from task 1
             assert_eq!(guard.completed(), 3); // both done
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     #[test]
@@ -1133,17 +1105,17 @@ mod tests {
             .build::<RawMutex>(TestIO::new(2));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(0);
             guard.open_gate(1);
         }
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_mut();
             assert_eq!(guard.counter(), 22);
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     #[test]
@@ -1157,7 +1129,7 @@ mod tests {
 
         // Both ran their first half: 1 + 10 = 11.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 11);
         }
 
@@ -1165,16 +1137,16 @@ mod tests {
         // synchronously. The tick loop picks up the wake for task 1
         // and polls it too, so both complete in one tick cycle.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(0);
         }
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 22); // 1+1 + 10+10
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1187,7 +1159,7 @@ mod tests {
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
-        let guard = machine.lock();
+        let guard = machine.lock_ref();
         assert_eq!(guard.counter(), 1);
     }
 
@@ -1198,11 +1170,11 @@ mod tests {
             .build::<RawMutex>(TestIO::new(1));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.counter.store(42, Ordering::SeqCst);
         }
 
-        let guard = machine.lock();
+        let guard = machine.lock_ref();
         assert_eq!(guard.counter(), 42);
     }
 
@@ -1213,7 +1185,7 @@ mod tests {
             .build::<RawMutex>(TestIO::new(1));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 1);
             guard.open_gate(0);
             // Task is woken but hasn't run — we still hold the lock.
@@ -1221,7 +1193,7 @@ mod tests {
         }
         // Guard dropped → tick → task resumes.
 
-        let guard = machine.lock();
+        let guard = machine.lock_ref();
         assert_eq!(guard.counter(), 2);
     }
 
@@ -1236,21 +1208,21 @@ mod tests {
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
 
-        assert!(!machine.get_pin().is_done());
+        assert!(!machine.is_done());
 
         // Complete one task — still not done.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(0);
         }
-        assert!(!machine.get_pin().is_done());
+        assert!(!machine.is_done());
 
         // Complete the other.
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(1);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     #[test]
@@ -1260,11 +1232,11 @@ mod tests {
             .build::<RawMutex>(TestIO::new(1));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(0);
         }
         // is_done calls tick internally before checking.
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     // -----------------------------------------------------------------------
@@ -1361,8 +1333,8 @@ mod tests {
             .with(task_noop)
             .build::<RawMutex>(TestIO::new(0));
 
-        assert!(machine.get_pin().is_done());
-        let guard = machine.lock();
+        assert!(machine.is_done());
+        let guard = machine.lock_ref();
         assert_eq!(guard.counter(), 0);
     }
 
@@ -1374,22 +1346,22 @@ mod tests {
             .build::<RawMutex>(TestIO::new(2));
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 11); // 1 + 10
             assert_eq!(guard.completed(), 1); // only task 0
         }
-        assert!(!machine.get_pin().is_done());
+        assert!(!machine.is_done());
 
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             guard.open_gate(1);
         }
         {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 21);
             assert_eq!(guard.completed(), 3);
         }
-        assert!(machine.get_pin().is_done());
+        assert!(machine.is_done());
     }
 
     #[test]
@@ -1399,10 +1371,10 @@ mod tests {
             .build::<RawMutex>(TestIO::new(1));
 
         for _ in 0..10 {
-            let guard = machine.lock();
+            let guard = machine.lock_ref();
             assert_eq!(guard.counter(), 1); // no change
         }
-        assert!(!machine.get_pin().is_done());
+        assert!(!machine.is_done());
     }
 
     #[test]

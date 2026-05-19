@@ -42,7 +42,7 @@ async fn reader(io: Pin<&'static MyIO>) -> TaskEnd {
 }
 
 // 3. Build the machine.
-let machine: Arc<dyn ProcMachine<MyIO>> = PROC_MACHINE_JOBS_BASE
+let machine: Arc<dyn ProcMachine<MyIO>> = PROC_MACHINE_BUILDER
     .with(reader)
     .build(MyIO { exchange: IoExchange::new() });
 
@@ -87,7 +87,7 @@ struct, using the provided primitives:
 
 ## Compile-time task composition
 
-Tasks are assembled at compile time via a builder starting from `PROC_MACHINE_JOBS_BASE`.
+Tasks are assembled at compile time via a builder starting from `PROC_MACHINE_BUILDER`.
 Each `.with(task_fn)` call extends a type-level linked list — there is no dynamic dispatch,
 no trait objects, and no allocation per task. The resulting poll loop is a static chain of
 monomorphised function calls.

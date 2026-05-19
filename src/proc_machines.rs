@@ -32,10 +32,10 @@
 //!
 //! # Building a ProcMachine
 //!
-//! Use the builder pattern starting from [`PROC_MACHINE_JOBS_BASE`]:
+//! Use the builder pattern starting from [`PROC_MACHINE_BUILDER`]:
 //!
 //! ```rust,ignore
-//! let proto = PROC_MACHINE_JOBS_BASE
+//! let proto = PROC_MACHINE_BUILDER
 //!     .with(task_a)   // async fn task_a(io: Pin<&'static MyIO>) -> TaskEnd
 //!     .with(task_b)
 //!     .build(MyIO::new());
@@ -346,7 +346,7 @@ impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMach
 
 /// Builder trait for assembling tasks into a [`ProcMachine`].
 ///
-/// Start from [`PROC_MACHINE_JOBS_BASE`] and chain `.with(task_fn)` calls
+/// Start from [`PROC_MACHINE_BUILDER`] and chain `.with(task_fn)` calls
 /// to add tasks, then call `.build(io)` to produce the final
 /// `Arc<dyn ProcMachine<IO>>`.
 pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
@@ -377,7 +377,7 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
 
 /// Empty builder — no tasks registered yet.
 ///
-/// Use [`PROC_MACHINE_JOBS_BASE`] for the singleton instance.
+/// Use [`PROC_MACHINE_BUILDER`] for the singleton instance.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcMachineJobsBase();
 
@@ -489,11 +489,11 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
 /// Singleton starting point for the builder pattern.
 ///
 /// ```rust,ignore
-/// let machine = PROC_MACHINE_JOBS_BASE
+/// let machine = PROC_MACHINE_BUILDER
 ///     .with(my_task)
 ///     .build(MyIO::new());
 /// ```
-pub static PROC_MACHINE_JOBS_BASE: ProcMachineJobsBase = ProcMachineJobsBase();
+pub static PROC_MACHINE_BUILDER: ProcMachineJobsBase = ProcMachineJobsBase();
 
 /// The concrete `ProcMachine` implementation, allocated inside an `Arc`.
 ///
@@ -949,14 +949,14 @@ mod tests {
 
     #[test]
     fn build_single_task_machine() {
-        let _machine: Arc<dyn ProcMachine<IO = TestIO>> = PROC_MACHINE_JOBS_BASE
+        let _machine: Arc<dyn ProcMachine<IO = TestIO>> = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
     }
 
     #[test]
     fn build_two_task_machine() {
-        let machine: Arc<dyn DynTestIO + Send + Sync> = PROC_MACHINE_JOBS_BASE
+        let machine: Arc<dyn DynTestIO + Send + Sync> = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn immediate_task_runs_during_build() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn immediate_task_is_done() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn suspended_task_is_not_done() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn wake_and_resume_single_task() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn multiple_suspend_resume_cycles() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_multi_suspend)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[test]
     fn two_tasks_run_independently() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn wake_both_tasks_simultaneously() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -1122,7 +1122,7 @@ mod tests {
     fn cross_task_synchronous_wake() {
         // task_wakes_other: suspends on gate 0, then opens gate 1.
         // task_suspend_slot1: suspends on gate 1.
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_wakes_other)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn guard_deref_provides_io_access() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn guard_deref_mut_provides_mutable_access() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn guard_drop_ticks_machine() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn is_done_false_while_tasks_pending() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn is_done_ticks_before_answering() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn zero_work_task_completes_at_build() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_noop)
             .build::<RawMutex>(TestIO::new(0));
 
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn mix_immediate_and_suspended_tasks() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_immediate)
             .with(task_suspend_slot1)
             .build::<RawMutex>(TestIO::new(2));
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn repeated_lock_unlock_without_wakes() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 
@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn debug_format_shows_io_and_alive_mask() {
-        let machine = PROC_MACHINE_JOBS_BASE
+        let machine = PROC_MACHINE_BUILDER
             .with(task_suspend_slot0)
             .build::<RawMutex>(TestIO::new(1));
 

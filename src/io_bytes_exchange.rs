@@ -179,10 +179,9 @@ impl IoReader for IoBytesExchange {
             EXCH_FULL_CLOSED => EXCH_DONE,
             // Terminal (DONE or DROPPED) — end-of-stream, repeatable.
             _ => {
-                // con_poll* contract: each EOS return counts as consuming
-                // one repetition of the signal, so pre-wake the caller.
-                // The caller must recognise EOS and break its loop.
-                cx.waker().wake_by_ref();
+                // con_poll* contract: end-of-stream is idempotent — repeated
+                // reads keep returning it — so it does NOT pre-wake.  The
+                // caller must recognise EOS and break its loop.
                 return Poll::Ready(Ok(None));
             }
         };
@@ -1164,11 +1163,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Reader pre-emptive wakeup on EOF
+    // Reader does NOT pre-wake on EOF (it is idempotent)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn eof_with_max_len_gt_zero_wakes_reader() {
+    fn eof_with_max_len_gt_zero_does_not_wake_reader() {
         let ex = IoBytesExchange::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
@@ -1182,16 +1181,16 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
-        // The reader should pre-emptively wake itself for consumption
-        // requests on terminal states.
-        assert!(
-            rw.count() > 0,
-            "reader should self-wake on EOF consumption request"
+        // con_poll* contract: EOF is idempotent and must not pre-wake.
+        assert_eq!(
+            rw.count(),
+            0,
+            "reader must not self-wake on EOF (idempotent)"
         );
     }
 
     #[test]
-    fn eof_with_max_len_zero_pre_wakes_reader() {
+    fn eof_with_max_len_zero_does_not_wake_reader() {
         let ex = IoBytesExchange::new();
         let (rw, rwaker) = make_waker();
         let mut rcx = Context::from_waker(&rwaker);
@@ -1205,12 +1204,12 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected None, got {:?}", other),
         }
-        // con_poll* contract: each EOS return counts as consumption, so
-        // it pre-wakes even with max_len == 0.  The caller is responsible
-        // for recognising the signal and breaking out of its loop.
-        assert!(
-            rw.count() > 0,
-            "reader should self-wake on EOF regardless of max_len"
+        // con_poll* contract: EOF is idempotent and must not pre-wake,
+        // regardless of max_len.
+        assert_eq!(
+            rw.count(),
+            0,
+            "reader must not self-wake on EOF regardless of max_len"
         );
     }
 

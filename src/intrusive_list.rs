@@ -38,6 +38,7 @@ use lock_api::{MutexGuard, RawMutex};
 pub trait IntrusiveNodeValue: Sized {
     /// The value type stored in the head node mutex.
     type HeadValue;
+    /// The raw mutex type protecting the head node's value.
     type RawMutex: RawMutex;
 
     /// Locks the mutex on this head node.
@@ -253,6 +254,8 @@ impl<V: IntrusiveNodeValue> IntrusiveListGuard<'_, V> {
 /// (`typ`) determines the node's role and provides mutex access and
 /// head-pointer navigation.
 pub struct IntrusiveListNode<V: IntrusiveNodeValue> {
+    /// The node-type discriminant, providing mutex access and head-pointer
+    /// navigation for this node.
     pub typ: V,
     prev: UnsafeLink<IntrusiveListNode<V>>,
     next: UnsafeLink<IntrusiveListNode<V>>,

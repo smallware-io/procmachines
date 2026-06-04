@@ -68,12 +68,15 @@ use crate::{MutLockable, RefLockable};
 
 /// A procedural state machine that advances synchronously.
 ///
-/// External code interacts with the machine by locking the IO struct (via
-/// [`LockableIo::lock`]) and reading/writing its fields. Internal tasks
-/// advance automatically when the lock is released.
+/// External code interacts with the machine by locking the IO struct (via the
+/// [`MutLockable::lock_mut`] / [`RefLockable::lock_ref`] blanket impls) and
+/// reading/writing its fields. Internal tasks advance automatically when the
+/// lock is released.
 ///
-/// Callers work with `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachine: core::fmt::Debug + Send + Sync {
+/// Callers typically work with `Arc<dyn ProcMachine<IO = ...>>`.
+pub trait ProcMachine: Send + Sync {
+    /// The shared IO struct through which external code and internal tasks
+    /// communicate.
     type IO;
 
     /// Returns `true` when every internal task has completed.
@@ -81,22 +84,25 @@ pub trait ProcMachine: core::fmt::Debug + Send + Sync {
     /// Also ticks the machine, so any pending wakes are processed first.
     fn is_done(&self) -> bool;
 
-    /// Check for external wakes to the internal jobs.
+    /// Check for completion and external wakes to the internal jobs.
     ///
     /// If any of the tasks internal to this `ProcMachine` have been woken
     /// outside of a `lock()`, then this will execute those tasks until they all block
     /// or terminate.
     ///
-    /// Whether or not there were any waiting tasks, `cx` waker is then registered
-    /// to be notified the next time such an external wake happens, and Poll::Pending
-    /// is returned.
+    /// If the ProcMachine is finished (all internal tasks have completed), then
+    /// `Poll::Ready(())` will be returned.
+    ///
+    /// Otherwise, the caller's waker is registered to be notified when the next
+    /// external wake happens or when the machine is done, and `Poll::Pending` is
+    /// returned.
     ///
     /// IMPORTANT: Any previously registered waker is discarded, so there MUST be
     /// at most one task calling this method.
     ///
-    /// It is only necessary to call this method if the internal tasks could poll
-    /// something "external", that can signal outside of `lock()`
-    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()>;
+    /// It is only necessary to call this method if the "internal" tasks can poll
+    /// something "external", that can wake when the machine isn't running.
+    fn external_poll(&self, cx: &mut Context<'_>) -> Poll<()>;
 
     /// Acquires the inner mutex and returns a mutable ref to the IO struct.
     ///
@@ -110,15 +116,25 @@ pub trait ProcMachine: core::fmt::Debug + Send + Sync {
 
     /// Ticks the machine and releases the inner mutex.
     ///
+    /// Returns `true` if all internal tasks in the machine have
+    /// finished.
+    ///
     /// # Safety
     ///
     /// - Must be called exactly once after a corresponding
     ///   [`unsafe_lock_io`](ProcMachine::unsafe_lock_io).
     /// - No references derived from the pointer returned by `unsafe_lock_io`
     ///   may be used after this call.
-    unsafe fn unsafe_unlock_io(&self);
+    unsafe fn unsafe_unlock_io(&self) -> bool;
 }
 
+/// A guard that provides access to a [`ProcMachine`]'s IO struct for the
+/// duration of a critical section.
+///
+/// Obtained through the [`RefLockable::lock_ref`] / [`MutLockable::lock_mut`]
+/// blanket implementations.  It dereferences to the machine's
+/// [`IO`](ProcMachine::IO) struct, and when it is dropped the machine is ticked
+/// and the inner mutex is released.
 pub struct ProcMachineRefGuard<'a, T>
 where
     T: ProcMachine + ?Sized,
@@ -231,6 +247,10 @@ pub struct TaskEnd();
 /// Each node knows how many tasks are in the chain ([`DEPTH`](Self::DEPTH)),
 /// can poll them selectively via a bitmask, and returns an updated bitmask
 /// indicating which tasks are still alive.
+///
+/// This is an implementation detail of the builder machinery and is not part
+/// of the stable public API.
+#[doc(hidden)]
 pub trait ProcMachineFutures {
     /// Number of tasks in this chain (0 for the base, N for N tasks).
     const DEPTH: u8;
@@ -246,6 +266,7 @@ pub trait ProcMachineFutures {
 }
 
 /// Base case: an empty chain with no tasks.
+#[doc(hidden)]
 pub struct ProcMachineFuturesBase();
 
 impl ProcMachineFutures for ProcMachineFuturesBase {
@@ -266,6 +287,7 @@ impl ProcMachineFutures for ProcMachineFuturesBase {
 ///
 /// The future is `Option<FUT>` — `Some` while the task is alive, `None`
 /// after it completes.
+#[doc(hidden)]
 pub struct ProcMachineFuturesExtension<
     PREV: ProcMachineFutures,
     FUT: Future<Output = TaskEnd> + 'static,
@@ -349,7 +371,7 @@ impl<PREV: ProcMachineFutures, FUT: Future<Output = TaskEnd> + 'static> ProcMach
 /// Start from [`PROC_MACHINE_BUILDER`] and chain `.with(task_fn)` calls
 /// to add tasks, then call `.build(io)` to produce the final
 /// `Arc<dyn ProcMachine<IO>>`.
-pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
+pub trait ProcMachineJobs<IO: Send + 'static> {
     /// Number of tasks registered so far.
     const DEPTH: u8;
 
@@ -373,6 +395,17 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
     {
         ProcMachineImpl::<R, IO, Self::FUTURES>::new(io, self)
     }
+    /// Like [`build`](ProcMachineJobs::build), but uses
+    /// [`parking_lot::RawMutex`] as the lock implementation.
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
+    fn build_std(self, io: IO) -> Arc<ProcMachineImpl<parking_lot::RawMutex, IO, Self::FUTURES>>
+    where
+        Self: Sized + 'static,
+    {
+        ProcMachineImpl::<parking_lot::RawMutex, IO, Self::FUTURES>::new(io, self)
+    }
 }
 
 /// Empty builder — no tasks registered yet.
@@ -381,7 +414,7 @@ pub trait ProcMachineJobs<IO: Send + Debug + 'static> {
 #[derive(Debug, Clone, Copy)]
 pub struct ProcMachineJobsBase();
 
-impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
+impl<IO: Send + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
     const DEPTH: u8 = 0;
     type FUTURES = ProcMachineFuturesBase;
 
@@ -396,8 +429,9 @@ impl<IO: Send + Debug + 'static> ProcMachineJobs<IO> for ProcMachineJobsBase {
 }
 
 /// Builder with one additional task appended to a `PREV` builder.
+#[doc(hidden)]
 pub struct ProcMachineJobsExtension<
-    IO: Send + Debug + 'static,
+    IO: Send + 'static,
     PREV: ProcMachineJobs<IO>,
     FUT: Future<Output = TaskEnd> + 'static,
 > {
@@ -406,7 +440,7 @@ pub struct ProcMachineJobsExtension<
     proc: fn(Pin<&'static IO>) -> FUT,
 }
 
-impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> + 'static>
+impl<IO: Send, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> + 'static>
     ProcMachineJobs<IO> for ProcMachineJobsExtension<IO, PREV, FUT>
 {
     const DEPTH: u8 = PREV::DEPTH + 1;
@@ -439,8 +473,7 @@ impl<IO: Send + Debug, PREV: ProcMachineJobs<IO>, FUT: Future<Output = TaskEnd> 
 // ============================================================================
 
 /// The mutex-protected interior: IO + futures + alive tracking.
-#[derive(Debug)]
-struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
+struct ProcMachineInner<IO: Send, FUTURES: ProcMachineFutures> {
     futures: FUTURES,
     /// Bitmask of tasks that have not yet completed. Bit `n` corresponds to
     /// the task at depth `n`. Updated after every `poll` call.
@@ -448,7 +481,16 @@ struct ProcMachineInner<IO: Send + Debug, FUTURES: ProcMachineFutures> {
     io: IO,
 }
 
-impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
+impl<IO: Send + Debug, FUTURES: ProcMachineFutures> Debug for ProcMachineInner<IO, FUTURES> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProcMachineImpl")
+            .field("io", &self.io)
+            .field("alive_mask", &self.alive_mask)
+            .finish()
+    }
+}
+
+impl<IO: Send, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
     fn new(io: IO) -> Self {
         Self {
             io,
@@ -458,7 +500,7 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
     }
 }
 
-impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
+impl<IO: Send, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES> {
     /// Repeatedly polls tasks until no more wakes are pending.
     ///
     /// Each iteration atomically swaps `wake_mask` to 0 (claiming all
@@ -468,7 +510,7 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
     /// the new wake bit lands in `wake_mask` and is picked up on the next
     /// loop iteration.
     ///
-    /// Returns `true` if any tasks are still alive.
+    /// Returns `true` if all tasks are done
     fn tick<T: MultiWake + 'static>(&mut self, waker: &Arc<T>, wake_mask: &AtomicU32) -> bool {
         // Set the ticking flag so wakes aren't counted as external
         loop {
@@ -482,7 +524,7 @@ impl<IO: Send + Debug, FUTURES: ProcMachineFutures> ProcMachineInner<IO, FUTURES
                 break;
             }
         }
-        self.alive_mask != 0
+        self.alive_mask == 0
     }
 }
 
@@ -499,14 +541,14 @@ pub static PROC_MACHINE_BUILDER: ProcMachineJobsBase = ProcMachineJobsBase();
 ///
 /// # Layout
 ///
-/// - `inner`: Mutex-protected [`ProcMachineInner`] (IO + futures + alive_mask).
+/// - `inner`: Mutex-protected `ProcMachineInner` (IO + futures + alive_mask).
 /// - `wake_mask`: Atomic bitmask of pending wakes. Lives *outside* the mutex
 ///   so that [`MultiWake::wake`] can set bits without acquiring the lock
 ///   (wakes may fire from any thread or from inside a poll).
 /// - `raw_arc`: Raw self-pointer set once during construction. Used by
 ///   trait-object methods ([`is_done`](ProcMachine::is_done),
 ///   [`unsafe_unlock_io`](ProcMachine::unsafe_unlock_io)) to reconstruct
-///   a temporary `Arc<Self>` needed by [`tick`](ProcMachineInner::tick).
+///   a temporary `Arc<Self>` needed by the internal `tick`.
 ///
 /// # Safety
 ///
@@ -514,7 +556,12 @@ pub static PROC_MACHINE_BUILDER: ProcMachineJobsBase = ProcMachineJobsBase();
 /// `unsafe impl Send + Sync`. This is sound because `raw_arc` is
 /// immutable after construction and always points to the Arc's own
 /// allocation, which is guaranteed to be alive while any `&self` exists.
-pub struct ProcMachineImpl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> {
+///
+/// This concrete type is an implementation detail of [`ProcMachineJobs::build`]
+/// / [`ProcMachineJobs::build_std`]; interact with the machine through the
+/// [`ProcMachine`] trait and the [`RefLockable`] / [`MutLockable`] guards.
+#[doc(hidden)]
+pub struct ProcMachineImpl<R: RawMutex, IO: Send, FUTURES: ProcMachineFutures + 'static> {
     wake_mask: AtomicU32,
     external_waker: AtomicWaker,
     raw_arc: *const Self,
@@ -524,22 +571,22 @@ pub struct ProcMachineImpl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFu
 // SAFETY: All mutable state is behind the Mutex or is AtomicU32.
 // raw_arc is immutable after construction and points to the Arc's own
 // allocation (which is alive while any reference exists).
-unsafe impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Send
+unsafe impl<R: RawMutex, IO: Send, FUTURES: ProcMachineFutures + 'static> Send
     for ProcMachineImpl<R, IO, FUTURES>
 {
 }
-unsafe impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Sync
+unsafe impl<R: RawMutex, IO: Send, FUTURES: ProcMachineFutures + 'static> Sync
     for ProcMachineImpl<R, IO, FUTURES>
 {
 }
 
-impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debug
+impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures> Debug
     for ProcMachineImpl<R, IO, FUTURES>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let guard = self.inner.lock();
         f.debug_struct("ProcMachineImpl")
-            .field("io", &&(guard.io)) // TODO better debug for
+            .field("io", &(guard.io))
             .field("alive_mask", &guard.alive_mask)
             .finish()
     }
@@ -551,7 +598,7 @@ impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures> core::fmt::Debu
 /// the mutex is held (e.g. a task writes to an IoExchange, which wakes
 /// the reader's waker synchronously). Because `wake_mask` is atomic and
 /// lives outside the mutex, this never deadlocks.
-impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> MultiWake
+impl<R: RawMutex, IO: Send, FUTURES: ProcMachineFutures + 'static> MultiWake
     for ProcMachineImpl<R, IO, FUTURES>
 {
     fn wake(&self, n: u8) {
@@ -578,7 +625,7 @@ impl<R: RawMutex, IO: Send + Debug, FUTURES: ProcMachineFutures + 'static> Multi
     }
 }
 
-impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
+impl<R: RawMutex + 'static, IO: Send + 'static, FUTURES: ProcMachineFutures + 'static>
     ProcMachineImpl<R, IO, FUTURES>
 {
     /// Allocates the ProcMachine, initialises futures, and performs the
@@ -624,8 +671,8 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
     }
 }
 
-impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutures + 'static>
-    ProcMachine for ProcMachineImpl<R, IO, FUTURES>
+impl<R: RawMutex + 'static, IO: Send + 'static, FUTURES: ProcMachineFutures + 'static> ProcMachine
+    for ProcMachineImpl<R, IO, FUTURES>
 {
     type IO = IO;
     fn is_done(&self) -> bool {
@@ -637,7 +684,11 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
             Arc::from_raw(self.raw_arc)
         };
         let mut guard = self.inner.lock();
-        !guard.tick(&arc, &self.wake_mask)
+        let ret = guard.tick(&arc, &self.wake_mask);
+        if ret {
+            self.external_waker.wake();
+        }
+        ret
     }
 
     unsafe fn unsafe_lock_io(&self) -> &mut IO {
@@ -648,7 +699,7 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
         unsafe { &mut (*inner_ptr).io }
     }
 
-    unsafe fn unsafe_unlock_io(&self) {
+    unsafe fn unsafe_unlock_io(&self) -> bool {
         // Reconstruct a temporary Arc for tick (same pattern as is_done).
         let arc: Arc<Self> = unsafe {
             Arc::increment_strong_count(self.raw_arc);
@@ -658,21 +709,26 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
             // Tick while still holding the lock — this processes any wakes
             // that occurred during the critical section.
             let inner_ptr = self.inner.data_ptr();
-            (*inner_ptr).tick(&arc, &self.wake_mask);
+            let is_done = (*inner_ptr).tick(&arc, &self.wake_mask);
             // Now release the raw mutex.
             self.inner.raw().unlock();
-        };
+            if is_done {
+                self.external_waker.wake();
+            }
+            is_done
+        }
     }
 
-    fn poll_external(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.external_waker.register(cx.waker());
-        if (self.wake_mask.load(Ordering::Relaxed) & 0x7FFFFFFF) != 0 {
-            unsafe {
-                self.unsafe_lock_io();
-                self.unsafe_unlock_io();
-            }
+    fn external_poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let is_done = unsafe {
+            self.unsafe_lock_io();
+            self.unsafe_unlock_io()
+        };
+        if !is_done {
+            self.external_waker.register(cx.waker());
+            return Poll::Pending;
         }
-        Poll::Pending
+        Poll::Ready(())
     }
 }
 
@@ -699,8 +755,12 @@ impl<R: RawMutex + 'static, IO: Send + Debug + 'static, FUTURES: ProcMachineFutu
 ///
 /// Implemented by the machine's internal state to set the corresponding bit
 /// in `wake_mask`.
+///
+/// This is an implementation detail of the multi-waker machinery and is not
+/// part of the stable public API.
+#[doc(hidden)]
 pub trait MultiWake: Send + Sync {
-    /// Signal that the task at index `n` (0–31) should be polled.
+    /// Signal that the task at index `n` (0–30) should be polled.
     fn wake(&self, n: u8);
 }
 

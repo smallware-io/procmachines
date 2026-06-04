@@ -16,6 +16,8 @@ use core::{
 
 use futures::{Sink, SinkExt};
 
+use crate::RefLockable;
+
 /// A single-producer `Sink`-like trait with interior mutability (`&self` receivers).
 ///
 /// All methods take `&self`, enabling use from contexts that only have a
@@ -100,6 +102,38 @@ pub trait IoSink<ITEM> {
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }
 
+impl<T, U, ITEM> IoSink<ITEM> for T
+where
+    T: RefLockable<Target = U> + ?Sized,
+    U: IoSink<ITEM> + ?Sized,
+{
+    type Error = U::Error;
+
+    fn prod_poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_ready(cx)
+    }
+
+    fn prod_poll_send(
+        &self,
+        cx: &mut Context<'_>,
+        item: &mut Option<ITEM>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_send(cx, item)
+    }
+
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_flush(cx)
+    }
+
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_close(cx)
+    }
+}
+
 /// A wrapper around a [`Sink`] that implements the [`IoSink`] trait.
 ///
 /// All methods proxy to the inner sink's [`Sink`] implementation. The inner
@@ -113,11 +147,18 @@ impl<ITEM, SINK> SinkIoSink<ITEM, SINK>
 where
     SINK: Sink<ITEM> + Unpin,
 {
+    /// Creates a new `SinkIoSink` wrapping the given [`Sink`].
     pub fn new(inner: SINK) -> Self {
         Self {
             inner: RefCell::new(inner),
             _phantom: core::marker::PhantomData,
         }
+    }
+}
+
+impl<ITEM, SINK: Sink<ITEM>> core::fmt::Debug for SinkIoSink<ITEM, SINK> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SinkIoSink").finish_non_exhaustive()
     }
 }
 

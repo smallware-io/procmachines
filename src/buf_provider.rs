@@ -1,11 +1,25 @@
+//! Buffer providers for byte-stream readers.
+//!
+//! An [`AsyncBufProvider`] supplies the [`BytesMut`] buffers that a byte reader
+//! reads into, decoupling the read loop from the buffer-sizing and recycling
+//! policy.  [`CyclicBufProvider`] is a ready-made implementation that recycles
+//! a fixed pool of buffers.
+
 use core::task::Poll;
 
 use bytes::BytesMut;
 
-/// A trait for providing `BytesMut` buffers to read data into.
-/// Implemnetations of this trait determine the buffer size and recycling strategy.
-/// `ReaderIoReader` uses this to get buffers for its internal `poll_read_buf` calls.
+/// A trait for providing [`BytesMut`] buffers to read data into.
+///
+/// Implementations of this trait determine the buffer size and recycling
+/// strategy.  [`ReaderIoReader`](crate::tokio_reader_writer::ReaderIoReader)
+/// uses this to obtain buffers for its internal reads.
 pub trait AsyncBufProvider {
+    /// Attempts to provide a buffer to read into.
+    ///
+    /// Returns [`Poll::Ready`] with a buffer ready to be filled, or
+    /// [`Poll::Pending`] if no buffer is currently available (in which case the
+    /// caller's waker must have been registered for later notification).
     fn poll_get_buf(&mut self) -> Poll<BytesMut>;
 }
 
@@ -29,6 +43,12 @@ impl<const COUNT: usize, FALLOC> CyclicBufProvider<COUNT, FALLOC>
 where
     FALLOC: Fn() -> BytesMut,
 {
+    /// Creates a new provider that allocates buffers with `f_alloc` and
+    /// recycles up to `COUNT` of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `COUNT` is zero.
     pub fn new(f_alloc: FALLOC) -> Self {
         if COUNT < 1 {
             panic!("CyclicBufProvider requires COUNT >= 1");

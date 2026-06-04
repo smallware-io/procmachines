@@ -1,42 +1,90 @@
+//! A compact, transport-agnostic I/O error type.
+//!
+//! [`IoError`] is a small `Copy` enum covering the common failure modes seen
+//! across the I/O primitives in this crate.  It is deliberately independent of
+//! [`std::io::Error`] so that it can be used in `no_std` builds, but when the
+//! `std` feature is enabled it converts to and from [`std::io::Error`] and
+//! [`std::io::ErrorKind`].  Each variant also maps to the closest HTTP status
+//! code via [`IoError::to_http_status`], and round-trips through its variant
+//! name via [`IoError::as_str`] / [`FromStr`].
+
 use core::convert::Infallible;
 use core::fmt::Display;
 use core::ops::Deref;
 use core::str::FromStr;
 
-/// Simple common types of I/O error
+/// Simple common types of I/O error.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in future
+/// releases, so callers should always include a wildcard arm when matching.
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum IoError {
+    /// An unknown or uncategorised error.
     Unknown,
+    /// An internal failure that is not attributable to the caller's request.
     InternalFailure,
+    /// The resource is temporarily offline or unavailable; retrying later may
+    /// succeed.
     TemporarilyOffline,
+    /// The operation is not valid in the target's current state.
     InvalidState,
+    /// A remote peer failed for an unspecified reason.
     PeerFailure,
+    /// The connection was closed by the peer (a broken pipe).
     BrokenPipe,
+    /// The requested item could not be found.
     NotFound,
+    /// The requested operation is not supported.
     Unsupported,
+    /// The caller does not have permission to perform the operation.
     PermissionDenied,
+    /// Authentication is required before the operation can proceed.
     AuthenticationRequired,
+    /// Authentication credentials could not be verified.
     AuthenticationFailed,
+    /// The peer actively refused the connection.
     ConnectionRefused,
+    /// The peer could not be reached.
     Unreachable,
+    /// The operation was aborted at the caller's request.
     AbortRequested,
+    /// A resource allocation conflicts with an existing one (e.g. an address
+    /// already in use).
     AllocationConflict,
+    /// The operation conflicts with the current state of the target.
     OperationConflict,
+    /// Optimistic concurrency control detected a conflicting update; the
+    /// operation can be retried.
     OptimisticConcurrencyFailure,
+    /// The operation would deadlock.
     Deadlock,
+    /// The object to be created already exists.
     AlreadyExists,
+    /// The input or message does not conform to the expected protocol or
+    /// format.
     MalformedInput,
+    /// The referenced data is not valid.
     InvalidData,
+    /// A reference could not be resolved to its target.
     InvalidReference,
+    /// The operation timed out.
     TimedOut,
+    /// The request is too large to process with the available resources.
     TooBig,
+    /// The resource is busy; the operation can be retried later.
     Busy,
+    /// A rate limit has been exceeded.
     RateLimited,
+    /// A quota has been exceeded.
     QuotaLimited,
+    /// The operation was interrupted before it could complete.
     Interrupted,
+    /// The end of the data was reached unexpectedly.
     UnexpectedEof,
+    /// The operation ran out of memory.
     OutOfMemory,
+    /// A storage limit was exceeded.
     OutOfStorage,
 }
 
@@ -52,7 +100,7 @@ impl Display for IoError {
                 write!(f, "Internal failure")
             }
             IoError::TemporarilyOffline => {
-                write!(f, "Internal failure")
+                write!(f, "Temporarily offline")
             }
             IoError::InvalidState => {
                 write!(f, "Invalid state for operation")
@@ -91,7 +139,7 @@ impl Display for IoError {
                 write!(f, "Conflicting allocations")
             }
             IoError::OperationConflict => {
-                write!(f, "Peer unreachable")
+                write!(f, "Operation conflicts with the current state")
             }
             IoError::OptimisticConcurrencyFailure => {
                 write!(f, "Optimistic concurrency control failure (can retry)")

@@ -1,6 +1,6 @@
 [package]
 name = "procmachines"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "State machines in the procedural style"
@@ -14,9 +14,12 @@ categories = ["network-programming", "asynchronous"]
 name = "procmachines"
 path = "src/lib.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["std", "tokio"]
-std = []
+std = ["dep:parking_lot"]
 tokio = ["dep:tokio", "dep:tokio-util"]
 
 [dependencies]
@@ -26,8 +29,21 @@ bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
 tokio = { version = "1", optional = true }
 tokio-util = { version = "^0.7.0", features=["io"], optional = true }
 lock_api = "0.4.14"
+parking_lot = { version = "0.12.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.41", features = ["rt-multi-thread", "macros"] }
 parking_lot = { version = "0.12.5" }
 
+
+[[example]]
+name = "fizz_buzz_minimal"
+path = "examples/fizz_buzz_minimal/main.rs"
+
+[[example]]
+name = "fizz_buzz_sans_io"
+path = "examples/fizz_buzz_sans_io/main.rs"
+
+[[example]]
+name = "fizz_buzz_io"
+path = "examples/fizz_buzz_io/main.rs"

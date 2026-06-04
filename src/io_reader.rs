@@ -10,6 +10,8 @@ use core::task::{Context, Poll};
 
 use bytes::Bytes;
 
+use crate::RefLockable;
+
 /// A single-consumer polling trait for reading bytes from an async stream.
 ///
 /// All methods take `&self` (interior mutability), so the reader and its
@@ -26,25 +28,23 @@ use bytes::Bytes;
 ///   registered to be woken later when the same call might return
 ///   [`Poll::Ready`].
 /// - If a `con_poll*` method returns [`Poll::Ready`] **and the return
-///   indicates that something was actually consumed**, the calling task is
-///   **immediately pre-woken** so it will be re-polled after processing
-///   the output.  This is the opposite of the `prod_poll*` contract on
+///   indicates that something was actually consumed** (a non-idempotent
+///   result, e.g. one or more bytes), the calling task is **immediately
+///   pre-woken** so it will be re-polled after processing the output.  This
+///   is the opposite of the `prod_poll*` contract on
 ///   [`IoWriter`](crate::io_writer::IoWriter): consumers are expected to
 ///   drain in a loop, so a consuming `Ready` keeps the task scheduled to
 ///   consume more.
-/// - A `Poll::Ready` that does **not** consume anything — for example a
-///   [`con_poll_read`](IoReader::con_poll_read) call with `max_len == 0`
-///   on a live stream, which only probes "is there data?" — does not
-///   pre-wake the caller.
-///
-/// End-of-stream — [`Poll::Ready(Ok(None))`](Poll::Ready) from
-/// [`con_poll_read`](IoReader::con_poll_read) — is treated as consumption
-/// for the purposes of this contract: each call consumes one repetition of
-/// the EOS signal and pre-wakes the caller, even when `max_len == 0`.  The
-/// signal is repeatable, so it is the caller's responsibility to recognise
-/// end-of-stream and break out of any loop that would otherwise consume it
-/// forever.
-pub trait IoReader: Send {
+/// - A `Poll::Ready` that does **not** consume anything is idempotent and
+///   does **not** pre-wake.  This covers both zero-length reads — for example
+///   a [`con_poll_read`](IoReader::con_poll_read) call with `max_len == 0`
+///   on a live stream, which only probes "is there data?" — and end-of-stream
+///   ([`Poll::Ready(Ok(None))`](Poll::Ready)).  End-of-stream is repeatable:
+///   each call returns the same EOS result, so pre-waking would spin the task
+///   forever.  It is the caller's responsibility to recognise end-of-stream
+///   and break out of its read loop.
+pub trait IoReader {
+    /// The error type returned by the reader.
     type Error;
     /// Attempts to read the next chunk of bytes from the stream.
     ///
@@ -56,7 +56,7 @@ pub trait IoReader: Send {
     /// | Condition | Meaning |
     /// |-----------|---------|
     /// | `Poll::Pending` | No data available yet; per the `con_poll*` contract the task is registered to be woken when that may change. |
-    /// | `Poll::Ready(Ok(None))` | End-of-stream has been reached.  This signal is repeatable and each return is treated as consuming one repetition, so the caller is pre-woken.  The caller must recognise EOS and break its read loop. |
+    /// | `Poll::Ready(Ok(None))` | End-of-stream has been reached.  This signal is repeatable and idempotent, so the caller is **not** pre-woken.  The caller must recognise EOS and break its read loop. |
     /// | `Poll::Ready(Ok(Some(data)))` | Up to `max_len` bytes were consumed: `data.len() <= max_len`, and `data.len() >= 1` whenever `max_len > 0`.  If `max_len == 0` the call acts as a "is there data?" probe and `data.len()` will be 0. |
     /// | `Poll::Ready(Err(e))` | A stream error has occurred. |
     ///
@@ -66,8 +66,7 @@ pub trait IoReader: Send {
     ///
     /// - `Ready(Ok(Some(data)))` with `max_len > 0` — bytes were
     ///   consumed, pre-wake.
-    /// - `Ready(Ok(None))` — one repetition of the EOS signal was
-    ///   consumed, pre-wake.
+    /// - `Ready(Ok(None))` — end-of-stream is idempotent, **no** pre-wake.
     /// - `Ready(Ok(Some(empty)))` from a `max_len == 0` probe on a live
     ///   stream — nothing consumed, **no** pre-wake.
     fn con_poll_read(
@@ -82,4 +81,26 @@ pub trait IoReader: Send {
     /// been dropped and will receive appropriate errors on subsequent sends.
     /// Any in-flight data is discarded.
     fn drop_read(&self);
+}
+
+impl<T, U> IoReader for T
+where
+    T: RefLockable<Target = U> + ?Sized,
+    U: IoReader + ?Sized,
+{
+    type Error = U::Error;
+
+    fn con_poll_read(
+        &self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        let guard = self.lock_ref();
+        guard.con_poll_read(cx, max_len)
+    }
+
+    fn drop_read(&self) {
+        let guard = self.lock_ref();
+        guard.drop_read()
+    }
 }

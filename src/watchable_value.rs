@@ -222,6 +222,12 @@ pub struct ValueWatch<'a, R: RawMutex, T: Clone> {
     _lifetime: PhantomData<&'a WatchableValue<R, T>>,
 }
 
+impl<R: RawMutex, T: Clone> Debug for ValueWatch<'_, R, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ValueWatch").finish_non_exhaustive()
+    }
+}
+
 impl<'a, R: RawMutex, T: Clone> ValueWatch<'a, R, T> {
     /// Creates a new watch against the given pinned watchable value.
     pub fn new(value: Pin<&'a WatchableValue<R, T>>) -> Self {

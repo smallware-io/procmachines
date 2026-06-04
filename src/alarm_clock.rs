@@ -15,9 +15,9 @@
 //! a [`Mutex`] protecting the current clock value; leaf nodes store their alarm
 //! threshold and a [`Waker`] in `UnsafeCell`s.
 //!
-//! When the clock advances, [`AlarmClock::set`] / [`AlarmClock::advance`] walk
+//! When the clock advances, [`AlarmClock::advance`] walks
 //! the linked list via [`crate::intrusive_list::IntrusiveListGuard::filter`]
-//! and wake every alarm whose threshold has been met.  When a `ClockAlarm` is
+//! and wakes every alarm whose threshold has been met.  When a `ClockAlarm` is
 //! polled, it checks the threshold under the lock and links itself into the
 //! list if it needs to wait.
 //!
@@ -27,7 +27,10 @@
 //! and `ClockAlarm` must be pinned before polling, because the list stores
 //! raw pointers to the nodes' addresses.
 
-use crate::intrusive_list::{IntrusiveListNode, IntrusiveNodeValue};
+use crate::{
+    WakerRef,
+    intrusive_list::{IntrusiveListNode, IntrusiveNodeValue},
+};
 use core::{
     cell::UnsafeCell,
     fmt::Debug,
@@ -36,11 +39,39 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use futures::never::Never;
 use lock_api::{Mutex, RawMutex};
 
 // ---------------------------------------------------------------------------
 // ClockNodeValue — IntrusiveNodeValue implementation for AlarmClock / ClockAlarm
 // ---------------------------------------------------------------------------
+
+struct ClockHeadInner<T>
+where
+    T: PartialOrd + Clone,
+{
+    // Current time in the clock
+    time: T,
+    // If this is `None`, then the external waker, if any, needs to be woken when any alarm is set.
+    // If this is `Some(t)`, then the external waker needs to be woken only if an alarm is set with
+    // deadline < t.
+    external_threshold: Option<T>,
+    // Waker for the provider task, if it's waiting for an alarm to be set.
+    external_waker: WakerRef,
+}
+
+impl<T> ClockHeadInner<T>
+where
+    T: PartialOrd + Clone,
+{
+    fn new(time: T) -> Self {
+        Self {
+            time,
+            external_threshold: None,
+            external_waker: WakerRef::new(),
+        }
+    }
+}
 
 /// The [`IntrusiveNodeValue`] implementation used by [`AlarmClock`] and
 /// [`ClockAlarm`].
@@ -49,10 +80,10 @@ use lock_api::{Mutex, RawMutex};
 /// Leaf nodes store an alarm threshold (`Option<T>`), a [`Waker`], and a raw
 /// pointer back to the head node.  `None` disables the alarm; comparisons
 /// use `PartialOrd`.
-enum ClockNodeValue<R: RawMutex, T> {
+enum ClockNodeValue<R: RawMutex, T: PartialOrd + Clone> {
     /// The sentinel head node.  Owns the mutex that protects the clock value
     /// and synchronises all list mutations.
-    Head { mutex: Mutex<R, T> },
+    Head { mutex: Mutex<R, ClockHeadInner<T>> },
     /// A leaf (alarm) node.  Stores the alarm threshold in `val`, a waker to
     /// notify when the alarm fires, and a raw pointer back to the head node
     /// so it can acquire the mutex.
@@ -65,11 +96,11 @@ enum ClockNodeValue<R: RawMutex, T> {
     },
 }
 
-impl<R: RawMutex, T> ClockNodeValue<R, T> {
+impl<R: RawMutex, T: PartialOrd + Clone> ClockNodeValue<R, T> {
     /// Creates a head-node value with the given initial clock value.
     fn new_head(val: T) -> Self {
         ClockNodeValue::Head {
-            mutex: Mutex::<R, T>::new(val),
+            mutex: Mutex::<R, ClockHeadInner<T>>::new(ClockHeadInner::new(val)),
         }
     }
 
@@ -160,11 +191,11 @@ impl<R: RawMutex, T> ClockNodeValue<R, T> {
     }
 }
 
-impl<R: RawMutex, T> IntrusiveNodeValue for ClockNodeValue<R, T> {
-    type HeadValue = T;
+impl<R: RawMutex, T: PartialOrd + Clone> IntrusiveNodeValue for ClockNodeValue<R, T> {
+    type HeadValue = ClockHeadInner<T>;
     type RawMutex = R;
 
-    fn lock_list(&self) -> lock_api::MutexGuard<'_, R, T> {
+    fn lock_list(&self) -> lock_api::MutexGuard<'_, R, ClockHeadInner<T>> {
         match self {
             ClockNodeValue::Head { mutex } => mutex.lock(),
             ClockNodeValue::Node { .. } => panic!("lock_list called on leaf node"),
@@ -213,38 +244,15 @@ impl<R: RawMutex, T> IntrusiveNodeValue for ClockNodeValue<R, T> {
 /// clock.set(10);
 /// // `alarm` will resolve on next poll.
 /// ```
-pub struct AlarmClock<R: RawMutex, T> {
+pub struct AlarmClock<R: RawMutex, T: PartialOrd + Clone> {
     head: IntrusiveListNode<ClockNodeValue<R, T>>,
 }
 
 impl<R: RawMutex, T: PartialOrd + Clone> AlarmClock<R, T> {
     /// Creates a new alarm clock with the given initial clock value.
-    pub fn new(val: T) -> Self {
+    pub fn new(time: T) -> Self {
         Self {
-            head: IntrusiveListNode::new(ClockNodeValue::new_head(val)),
-        }
-    }
-
-    /// Sets the clock to `val` unconditionally, waking any alarms whose
-    /// thresholds are now met.
-    ///
-    /// Unlike [`advance`](Self::advance), this allows setting the clock to a
-    /// value less than or equal to the current value.
-    pub fn set(&self, val: T) {
-        let mut guard = self.head.lock_head();
-        *guard = val;
-        unsafe {
-            guard.filter(|node| match node.get_val() {
-                Some(a) if *guard >= *a => {
-                    node.wake();
-                    false
-                }
-                None => {
-                    node.wake();
-                    false
-                }
-                _ => true,
-            });
+            head: IntrusiveListNode::new(ClockNodeValue::new_head(time)),
         }
     }
 
@@ -252,41 +260,86 @@ impl<R: RawMutex, T: PartialOrd + Clone> AlarmClock<R, T> {
     #[inline(always)]
     pub fn get(&self) -> T {
         let guard = self.head.lock_head();
-        (*guard).clone()
+        guard.time.clone()
     }
 
-    /// Advances the clock to `val` only if `val` is strictly greater than the
-    /// current value.
+    /// Advances the clock to `new_time` only if `new_time` is strictly greater than the
+    /// current time value.
     ///
-    /// Returns `true` if the clock was updated, `false` if `val` was not greater.
-    /// Any alarms whose thresholds are now met are woken.
-    pub fn advance(&self, val: T) -> bool {
+    /// If `new_time` is greater than clock's current time value, then the time is advanced
+    /// to `new_time`, and any alarms set for times <= `new_time` are woken.
+    ///
+    /// If the time is advanced and there is a waker registered by `external_poll_new_alarm`, then the
+    /// wake threshold is reset to `None`, so if nothing else is done, then it will be woken when the
+    /// next alarm is set.  Usually if external polling is being used, then that behaviour should be
+    /// reset by a new call to `external_poll_new_alarm` with a new threshold.
+    ///
+    /// Returns `None` if there are no remaining alarms set.  If there is a remaining alarm set, then
+    /// returns `Some(t)` where `t` is the earliest alarm deadline still set after this call.
+    pub fn advance(&self, new_time: T) -> Option<T> {
         let mut guard = self.head.lock_head();
-        if *guard >= val {
-            return false;
+        if new_time > guard.time {
+            guard.time = new_time;
         }
-        *guard = val;
+        guard.external_threshold = None;
+        let mut min_alarm: Option<T> = None;
+        let val_ref = &(guard.time);
         unsafe {
             guard.filter(|node| match node.get_val() {
-                Some(a) if *guard >= *a => {
-                    node.wake();
-                    false
+                Some(alarm_time) => {
+                    if *val_ref >= *alarm_time {
+                        node.wake();
+                        false
+                    } else {
+                        if let Some(min_t) = min_alarm.as_ref() {
+                            if *alarm_time < *min_t {
+                                min_alarm = Some(alarm_time.clone());
+                            }
+                        } else {
+                            min_alarm = Some(alarm_time.clone());
+                        }
+                        true
+                    }
                 }
                 None => {
                     node.wake();
                     false
                 }
-                _ => true,
             });
         }
-        true
+        min_alarm
+    }
+
+    /// Register an interest in a new alarm being set..
+    ///
+    /// If wake_threshold is None, then an interest is registered in any alarm being set.  Otherwise, an interest
+    /// is registered in any alarm being set with an alarm time < `wake_threshold`.
+    ///
+    /// If a new alarm is subsequently set that meets the interest, then the provider's waker is awoken.
+    ///
+    /// Note that the provider's waker is NOT automatically awoken if there are existing alarms that meet the interest.
+    /// Normally, `advance` would be called before this method to determine if there are any alarms that require immediate
+    /// action.
+    ///
+    /// Returns Poll::Pending ALWAYS
+    pub fn external_poll_new_alarm(
+        &self,
+        cx: &mut Context<'_>,
+        wake_threshold: Option<T>,
+    ) -> Poll<Never> {
+        let mut guard = self.head.lock_head();
+        guard.external_threshold = wake_threshold;
+        guard.external_waker.register(cx.waker());
+        Poll::Pending
     }
 }
 
-impl<R: RawMutex, T: Debug> Debug for AlarmClock<R, T> {
+impl<R: RawMutex, T: PartialOrd + Clone + Debug> Debug for AlarmClock<R, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let g = self.head.lock_head();
-        f.debug_struct("AlarmClock").field("val", &*g).finish()
+        f.debug_struct("AlarmClock")
+            .field("val", &(g.time))
+            .finish()
     }
 }
 
@@ -326,12 +379,18 @@ impl<R: RawMutex, T: Debug> Debug for AlarmClock<R, T> {
 ///
 /// The `'a` lifetime ties this alarm to its parent clock, ensuring the clock
 /// is not dropped while alarms reference it.
-pub struct ClockAlarm<'a, R: RawMutex, T> {
+pub struct ClockAlarm<'a, R: RawMutex, T: PartialOrd + Clone> {
     node: IntrusiveListNode<ClockNodeValue<R, T>>,
     _lifetime: PhantomData<&'a AlarmClock<R, T>>,
 }
 
-impl<'a, R: RawMutex, T: PartialOrd> ClockAlarm<'a, R, T> {
+impl<R: RawMutex, T: PartialOrd + Clone> Debug for ClockAlarm<'_, R, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClockAlarm").finish_non_exhaustive()
+    }
+}
+
+impl<'a, R: RawMutex, T: PartialOrd + Clone> ClockAlarm<'a, R, T> {
     /// Creates a new alarm against the given pinned clock.
     ///
     /// `wake_at` is the threshold value; the alarm fires when the clock reaches
@@ -392,7 +451,7 @@ impl<'a, R: RawMutex, T: PartialOrd> ClockAlarm<'a, R, T> {
     /// similar combinator that provides `&Pin<&mut Self>` rather than
     /// consuming the `Pin<&mut Self>`.
     pub fn alarm_poll(self: &Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<()> {
-        let guard = self.node.lock_head();
+        let mut guard = self.node.lock_head();
         unsafe {
             match self.node.typ.get_val() {
                 None => {
@@ -401,13 +460,20 @@ impl<'a, R: RawMutex, T: PartialOrd> ClockAlarm<'a, R, T> {
                     return Poll::Pending;
                 }
                 Some(alarm) => {
-                    if *guard >= *alarm {
+                    if guard.time >= *alarm {
                         // Threshold met — unlink without registering a waker.
                         // Any previous waker was already consumed by the clock
                         // advance that triggered this re-poll, or was never
                         // stored (first poll with condition already met).
                         guard.unlink(&self.node);
                         return Poll::Ready(());
+                    } else if let Some(threshold) = guard.external_threshold.as_ref() {
+                        if *alarm < *threshold {
+                            guard.external_threshold = None;
+                            guard.external_waker.wake();
+                        }
+                    } else {
+                        guard.external_waker.wake();
                     }
                 }
             }
@@ -422,7 +488,7 @@ impl<'a, R: RawMutex, T: PartialOrd> ClockAlarm<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex, T: PartialOrd> Future for ClockAlarm<'a, R, T> {
+impl<'a, R: RawMutex, T: PartialOrd + Clone> Future for ClockAlarm<'a, R, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> core::task::Poll<Self::Output> {
@@ -476,7 +542,7 @@ mod tests {
     /// Helper: call AlarmClock::set through a Pin<&mut AlarmClock> without
     /// accidentally hitting Pin::set (which expects a whole AlarmClock value).
     fn clock_set(clock: &Pin<&mut AlarmClock<RawMutex, u64>>, val: u64) {
-        clock.as_ref().get_ref().set(val);
+        clock.as_ref().get_ref().advance(val);
     }
 
     /// Helper: call ClockAlarm::set_alarm through a Pin<&mut ClockAlarm>.
@@ -485,6 +551,24 @@ mod tests {
     }
 
     type TestClock = AlarmClock<RawMutex, u64>;
+
+    /// Helper: register external interest via `external_poll_new_alarm`,
+    /// asserting (as the method guarantees) that it always returns `Pending`.
+    fn ext_poll(clock: &Pin<&mut TestClock>, waker: &Waker, threshold: Option<u64>) {
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            clock
+                .as_ref()
+                .get_ref()
+                .external_poll_new_alarm(&mut cx, threshold)
+                .is_pending()
+        );
+    }
+
+    /// White-box helper: read the head's current `external_threshold`.
+    fn ext_threshold(clock: &Pin<&mut TestClock>) -> Option<u64> {
+        clock.as_ref().get_ref().head.lock_head().external_threshold
+    }
 
     // -----------------------------------------------------------------------
     // AlarmClock basic tests
@@ -499,24 +583,24 @@ mod tests {
     #[test]
     fn alarm_clock_set() {
         let clock = TestClock::new(0u64);
-        clock.set(100);
+        clock.advance(100);
         assert_eq!(clock.get(), 100);
-        // set allows going backwards
-        clock.set(50);
-        assert_eq!(clock.get(), 50);
+        // can't advance backward
+        clock.advance(50);
+        assert_eq!(clock.get(), 100);
     }
 
     #[test]
     fn alarm_clock_advance_only_forward() {
         let clock = TestClock::new(10u64);
         // Advance to a larger value succeeds
-        assert!(clock.advance(20));
+        assert_eq!(clock.advance(20), None);
         assert_eq!(clock.get(), 20);
         // Advance to same value fails
-        assert!(!clock.advance(20));
+        assert_eq!(clock.advance(20), None);
         assert_eq!(clock.get(), 20);
         // Advance to smaller value fails
-        assert!(!clock.advance(5));
+        assert_eq!(clock.advance(20), None);
         assert_eq!(clock.get(), 20);
     }
 
@@ -898,12 +982,12 @@ mod tests {
         assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
 
         // Try to advance backwards — should fail
-        assert!(!clock.advance(5));
+        assert_eq!(clock.advance(5), Some(15));
         assert_eq!(clock.get(), 10);
         assert_eq!(tw.count(), 0);
 
         // Advance forward
-        assert!(clock.advance(15));
+        assert_eq!(clock.advance(15), None);
         assert_eq!(tw.count(), 1);
     }
 
@@ -948,7 +1032,7 @@ mod tests {
         let addr = clock_ref.get_ref() as *const TestClock as usize;
         let handle = tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            unsafe { &*(addr as *const TestClock) }.set(10);
+            unsafe { &*(addr as *const TestClock) }.advance(10);
         });
 
         alarm.as_mut().await;
@@ -967,9 +1051,9 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
             let clock = unsafe { &*(addr as *const TestClock) };
-            clock.set(5);
+            clock.advance(5);
             std::thread::sleep(std::time::Duration::from_millis(30));
-            clock.set(10);
+            clock.advance(10);
         });
 
         a1.as_mut().await;
@@ -993,30 +1077,6 @@ mod tests {
         assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
         assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
         assert_eq!(tw.count(), 0);
-    }
-
-    #[test]
-    fn ready_until_clock_set_back() {
-        let clock = pin!(AlarmClock::new(20u64));
-        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
-        let mut alarm = pin!(alarm);
-        let tw = TestWaker::new();
-        let waker = Waker::from(tw.clone());
-
-        // clock(20) >= alarm(10) → Ready
-        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
-
-        // Set clock back below the threshold
-        clock_set(&clock, 5);
-
-        // Now clock(5) < alarm(10) → Pending
-        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Pending);
-        assert_eq!(tw.count(), 0);
-
-        // Advance past threshold again → wakes
-        clock_set(&clock, 10);
-        assert_eq!(tw.count(), 1);
-        assert_eq!(poll_alarm(&mut alarm, &waker), Poll::Ready(()));
     }
 
     #[test]
@@ -1077,5 +1137,274 @@ mod tests {
         assert_eq!(alarm.as_mut().alarm_poll(&mut cx), Poll::Pending);
         clock_set(&clock, 10);
         assert_eq!(alarm.as_mut().alarm_poll(&mut cx), Poll::Ready(()));
+    }
+
+    // -----------------------------------------------------------------------
+    // external_poll_new_alarm tests
+    //
+    // `external_poll_new_alarm` registers a "provider" waker that should be
+    // notified when a *new* alarm is registered (via `alarm_poll`) that is
+    // earlier than the provider's current interest threshold.  The notification
+    // itself is delivered from `alarm_poll`'s pending branch; this method only
+    // records the threshold + waker and always returns `Pending`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn external_poll_always_pending() {
+        // The method is infallible-pending: `Poll<Never>` can only ever be
+        // `Pending`, but assert it explicitly for both threshold shapes.
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let w = Waker::from(ext.clone());
+        ext_poll(&clock, &w, None);
+        ext_poll(&clock, &w, Some(5));
+    }
+
+    #[test]
+    fn external_poll_records_threshold() {
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let w = Waker::from(ext.clone());
+
+        // Fresh clock starts with no recorded threshold.
+        assert_eq!(ext_threshold(&clock), None);
+
+        ext_poll(&clock, &w, Some(5));
+        assert_eq!(ext_threshold(&clock), Some(5));
+
+        // A subsequent registration overwrites the threshold.
+        ext_poll(&clock, &w, None);
+        assert_eq!(ext_threshold(&clock), None);
+
+        ext_poll(&clock, &w, Some(99));
+        assert_eq!(ext_threshold(&clock), Some(99));
+    }
+
+    #[test]
+    fn external_woken_on_any_alarm_when_threshold_none() {
+        // threshold == None means "wake me on ANY new alarm".
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, None);
+
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(1000));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+        // With a `None` threshold the recorded threshold stays `None`.
+        assert_eq!(ext_threshold(&clock), None);
+    }
+
+    #[test]
+    fn external_woken_on_earlier_alarm_resets_threshold() {
+        // threshold == Some(50) means "wake me when an alarm < 50 is set".
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, Some(50));
+
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(30));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+        // After firing, the threshold is reset to `None` so the provider is
+        // expected to re-register on its next poll.
+        assert_eq!(ext_threshold(&clock), None);
+    }
+
+    #[test]
+    fn external_not_woken_on_equal_or_later_alarm() {
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, Some(50));
+
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        // An alarm exactly at the threshold (50) is NOT earlier → no wake.
+        let a_eq = ClockAlarm::new(clock.as_ref(), Some(50));
+        let mut a_eq = pin!(a_eq);
+        assert_eq!(poll_alarm(&mut a_eq, &w), Poll::Pending);
+        assert_eq!(ext.count(), 0);
+        assert_eq!(ext_threshold(&clock), Some(50)); // untouched
+
+        // A later alarm (60) is also not earlier → no wake.
+        let a_late = ClockAlarm::new(clock.as_ref(), Some(60));
+        let mut a_late = pin!(a_late);
+        assert_eq!(poll_alarm(&mut a_late, &w), Poll::Pending);
+        assert_eq!(ext.count(), 0);
+        assert_eq!(ext_threshold(&clock), Some(50)); // still untouched
+    }
+
+    #[test]
+    fn external_not_woken_by_ready_alarm() {
+        // An alarm whose threshold is already met resolves immediately and is
+        // never "registered" — the provider has nothing to schedule, so it
+        // must not be woken.
+        let clock = pin!(TestClock::new(100u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, None);
+
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(50));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Ready(()));
+        assert_eq!(ext.count(), 0);
+        // Threshold left as-is (the ready path returns before touching it).
+        assert_eq!(ext_threshold(&clock), None);
+    }
+
+    #[test]
+    fn external_not_woken_by_disabled_alarm() {
+        // A disabled (`None`) alarm has no deadline, so the provider must not
+        // be woken when it is polled.
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, None);
+
+        let alarm = ClockAlarm::new(clock.as_ref(), None);
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext.count(), 0);
+    }
+
+    #[test]
+    fn external_reregistration_updates_waker() {
+        // Registering a second provider waker replaces the first.
+        let clock = pin!(TestClock::new(0u64));
+        let ext1 = TestWaker::new();
+        let ext2 = TestWaker::new();
+        let ew1 = Waker::from(ext1.clone());
+        let ew2 = Waker::from(ext2.clone());
+
+        ext_poll(&clock, &ew1, None);
+        ext_poll(&clock, &ew2, None); // replaces ew1
+
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext1.count(), 0);
+        assert_eq!(ext2.count(), 1);
+    }
+
+    #[test]
+    fn external_not_woken_without_registration() {
+        // No `external_poll_new_alarm` call → no provider waker → polling an
+        // alarm must not panic and obviously cannot wake anything.
+        let clock = pin!(TestClock::new(0u64));
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(10));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext_threshold(&clock), None);
+    }
+
+    #[test]
+    fn external_only_first_earlier_alarm_wakes() {
+        // Once an earlier alarm fires the provider, the threshold resets to
+        // `None`, but the waker slot has been consumed — so a second earlier
+        // alarm does not double-wake the (now absent) provider until it
+        // re-registers.
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, Some(50));
+
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        let a1 = ClockAlarm::new(clock.as_ref(), Some(40));
+        let mut a1 = pin!(a1);
+        assert_eq!(poll_alarm(&mut a1, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+
+        // Provider has not re-registered; another earlier alarm finds an empty
+        // waker slot (threshold is now `None`, so it takes the "any" path).
+        let a2 = ClockAlarm::new(clock.as_ref(), Some(20));
+        let mut a2 = pin!(a2);
+        assert_eq!(poll_alarm(&mut a2, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1); // not woken again
+    }
+
+    #[test]
+    fn advance_resets_external_threshold_without_waking() {
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+        ext_poll(&clock, &ew, Some(50));
+        assert_eq!(ext_threshold(&clock), Some(50));
+
+        // Advancing the clock resets the interest threshold to `None` but does
+        // NOT itself wake the provider.
+        clock.as_ref().get_ref().advance(10);
+        assert_eq!(ext_threshold(&clock), None);
+        assert_eq!(ext.count(), 0);
+
+        // Because the threshold is now `None` (and the provider waker is still
+        // registered — advance does not consume it), the very next alarm of any
+        // deadline wakes the provider.
+        let alarm = ClockAlarm::new(clock.as_ref(), Some(100));
+        let mut alarm = pin!(alarm);
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+        assert_eq!(poll_alarm(&mut alarm, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+    }
+
+    #[test]
+    fn external_provider_full_cycle() {
+        // End-to-end shape of how a timer provider uses the external API.
+        let clock = pin!(TestClock::new(0u64));
+        let ext = TestWaker::new();
+        let ew = Waker::from(ext.clone());
+
+        let tw = TestWaker::new();
+        let w = Waker::from(tw.clone());
+
+        // No alarms yet: provider asks to be woken on ANY alarm.
+        ext_poll(&clock, &ew, None);
+
+        // A far alarm (100) appears → provider notified.
+        let far = ClockAlarm::new(clock.as_ref(), Some(100));
+        let mut far = pin!(far);
+        assert_eq!(poll_alarm(&mut far, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+
+        // Provider reschedules for the earliest deadline (100): only wake me if
+        // something strictly earlier than 100 shows up.
+        ext_poll(&clock, &ew, Some(100));
+
+        // A later alarm (200) must not disturb the provider.
+        let later = ClockAlarm::new(clock.as_ref(), Some(200));
+        let mut later = pin!(later);
+        assert_eq!(poll_alarm(&mut later, &w), Poll::Pending);
+        assert_eq!(ext.count(), 1);
+
+        // An earlier alarm (50) must wake the provider and reset the threshold.
+        let earlier = ClockAlarm::new(clock.as_ref(), Some(50));
+        let mut earlier = pin!(earlier);
+        assert_eq!(poll_alarm(&mut earlier, &w), Poll::Pending);
+        assert_eq!(ext.count(), 2);
+        assert_eq!(ext_threshold(&clock), None);
     }
 }

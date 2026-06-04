@@ -1,3 +1,14 @@
+//! Adapters bridging Tokio's `AsyncRead`/`AsyncWrite` to this crate's I/O
+//! traits.
+//!
+//! [`ReaderIoReader`] wraps a [`tokio::io::AsyncRead`] and implements
+//! [`IoReader`], pulling read buffers from an [`AsyncBufProvider`].
+//! [`WriterIoWriter`] wraps a [`tokio::io::AsyncWrite`] and implements
+//! [`IoWriter`].  Together they let Tokio byte streams participate in the
+//! interior-mutable, `&self`-receiver I/O model used elsewhere in the crate.
+//!
+//! This module is only available when the `tokio` feature is enabled.
+
 use core::cell::RefCell;
 use core::cmp::min;
 use core::pin::Pin;
@@ -32,8 +43,9 @@ use crate::IoWriter;
 ///   drops the inner reader.
 /// - Once the inner reader has been dropped (either by reaching EOF / error,
 ///   or by an explicit [`drop_read`](IoReader::drop_read)), `con_poll_read`
-///   is in the EOF condition: it returns `Ready(Ok(None))` and pre-wakes the
-///   caller per the `con_poll*` contract.  The signal is repeatable.
+///   is in the EOF condition: it returns `Ready(Ok(None))`.  Per the
+///   `con_poll*` contract this signal is idempotent and repeatable, so it
+///   does **not** pre-wake the caller.
 /// - [`drop_read`](IoReader::drop_read) drops the inner reader and discards
 ///   any buffered data and pending error.
 ///
@@ -92,9 +104,8 @@ where
     ) -> Poll<Result<Option<Bytes>, IoError>> {
         let mut inner = self.inner.borrow_mut();
         if inner.reader.is_none() {
-            // Already in EOF state; one repetition of the EOS signal is
-            // consumed and the caller is pre-woken.
-            cx.waker().wake_by_ref();
+            // Already in the EOF state.  End-of-stream is idempotent, so per
+            // the con_poll_* contract it does not pre-wake.
             return Poll::Ready(Ok(None));
         };
         // attempt to read more data, if it's appropriate to do so.
@@ -142,13 +153,16 @@ where
                 // No data, but not EOF yet; we must be pending on the reader or the buf provider.  Don't pre-wake, just return Pending.
                 return Poll::Pending;
             }
-            // EOF condition
-            cx.waker().wake_by_ref();
+            // EOF is idempotent and does not pre-wake.  Error
+            // condition pre-wakes, since the error is consumed.
             inner.reader = None;
             let err = inner.got_eof.take().unwrap_or(None);
             return match err {
                 None => Poll::Ready(Ok(None)),
-                Some(e) => Poll::Ready(Err(e)),
+                Some(e) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Ready(Err(e))
+                }
             };
         }
         // We have data
@@ -156,7 +170,8 @@ where
             // Caller was just checking.  Not a consumption, so don't pre-wake, but return the empty probe result.
             return Poll::Ready(Ok(Some(Bytes::new())));
         }
-        // no matter what now, we're going to consume data or eof or error, so pre-wake the caller.
+        // We are about to consume at least one byte, so pre-wake the caller to
+        // keep it draining per the con_poll_* contract.
         cx.waker().wake_by_ref();
         Poll::Ready(Ok(Some(
             inner.cur_buf.split_to(min(max_len, have_len)).freeze(),
@@ -167,6 +182,16 @@ where
         let mut inner = self.inner.borrow_mut();
         inner.reader = None;
         inner.got_eof = None;
+    }
+}
+
+impl<READER, BP> core::fmt::Debug for ReaderIoReader<READER, BP>
+where
+    READER: AsyncRead + Send + Unpin,
+    BP: AsyncBufProvider + Send,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReaderIoReader").finish_non_exhaustive()
     }
 }
 
@@ -226,6 +251,15 @@ where
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut inner = self.inner.borrow_mut();
         Pin::new(&mut *inner).poll_shutdown(cx).map_err(Into::into)
+    }
+}
+
+impl<WRITER> core::fmt::Debug for WriterIoWriter<WRITER>
+where
+    WRITER: AsyncWrite + Send + Unpin,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WriterIoWriter").finish_non_exhaustive()
     }
 }
 
@@ -479,7 +513,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn reader_dropped_returns_eof_and_pre_wakes() {
+    fn reader_dropped_returns_eof_and_does_not_pre_wake() {
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![]);
         let r = ReaderIoReader::new(inner, bp);
@@ -491,15 +525,15 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected Ready(Ok(None)), got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake the caller");
+        assert_eq!(cw.count(), 0, "EOF is idempotent and must not pre-wake");
 
-        // EOF is repeatable.
+        // EOF is repeatable and remains idempotent.
         cw.reset();
         match r.con_poll_read(&mut cx, 1024) {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected repeated EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "repeated EOF must also pre-wake");
+        assert_eq!(cw.count(), 0, "repeated EOF must not pre-wake either");
     }
 
     // -----------------------------------------------------------------------
@@ -525,7 +559,7 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake");
+        assert_eq!(cw.count(), 0, "EOF is idempotent and must not pre-wake");
     }
 
     // -----------------------------------------------------------------------
@@ -671,9 +705,9 @@ mod tests {
     }
 
     #[test]
-    fn reader_zero_probe_eof_is_none_and_pre_wakes() {
-        // EOF probe with max_len == 0: per the trait contract, the EOS
-        // signal still counts as consumption and pre-wakes the caller.
+    fn reader_zero_probe_eof_is_none_and_does_not_pre_wake() {
+        // EOF probe with max_len == 0: per the trait contract, EOF is
+        // idempotent and does not pre-wake the caller.
         let bp = MockBufProvider::fixed(64);
         let inner = MockReader::new(vec![]);
         let r = ReaderIoReader::new(inner, bp);
@@ -685,7 +719,11 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected EOF, got {:?}", other.map(|_| ())),
         }
-        assert!(cw.count() > 0, "EOF must pre-wake even on max_len==0 probe");
+        assert_eq!(
+            cw.count(),
+            0,
+            "EOF is idempotent and must not pre-wake, even on a max_len==0 probe"
+        );
     }
 
     // -----------------------------------------------------------------------

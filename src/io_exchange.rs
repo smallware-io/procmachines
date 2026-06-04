@@ -55,9 +55,11 @@ use crate::{IoError, io_sink::IoSink, io_stream::IoStream};
 /// # Usage
 ///
 /// Embed `IoExchange` fields in the IO struct shared between a
-/// `ProcMachine`'s internal tasks and external code. Tasks use the
-/// [`IoSink`] / [`IoStream`] methods to send and receive items, while
-/// external code interacts through the [`IoGuard`](crate::IoGuard).
+/// [`ProcMachine`](crate::ProcMachine)'s internal tasks and external code.
+/// Tasks use the [`IoSink`] / [`IoStream`] methods to send and receive items,
+/// while external code interacts through the
+/// [`ProcMachineRefGuard`](crate::ProcMachineRefGuard) obtained by locking the
+/// machine.
 #[derive(Debug)]
 pub struct IoExchange<ITEM> {
     /// Waker for the reader side, notified when an item is placed or the
@@ -168,7 +170,8 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
             EXCH_FULL_FLUSH => EXCH_EMPTY_FLUSH,
             EXCH_FULL_CLOSED => EXCH_DONE,
             EXCH_DONE => {
-                cx.waker().wake_by_ref();
+                // End-of-stream is idempotent — repeated reads keep returning
+                // it — so per the con_poll_* contract it does not pre-wake.
                 return Poll::Ready(Ok(None));
             }
             // DROPPED
@@ -191,17 +194,18 @@ impl<ITEM> IoStream for IoExchange<ITEM> {
         self.writer.wake();
         drop(guard);
 
-        // An item (or the final EOS if nextst == DONE) was consumed, so
-        // pre-wake the caller per the con_poll* contract.
-        cx.waker().wake_by_ref();
-
         if let Some(item) = item {
+            // An item was consumed (a non-idempotent `Ready`), so pre-wake the
+            // caller per the con_poll_* contract to keep it draining.
+            cx.waker().wake_by_ref();
             Poll::Ready(Ok(Some(item)))
         } else if nextst == EXCH_DONE {
+            // End-of-stream is idempotent — do not pre-wake.
             Poll::Ready(Ok(None))
         } else {
             // The state said FULL but the item slot was empty — shouldn't happen
             // in correct usage. Self-wake and pend so the caller retries.
+            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }
@@ -575,9 +579,9 @@ mod tests {
     }
 
     #[test]
-    fn con_poll_read_pre_wakes_on_consume_and_eof() {
-        // Pre-wake when an item is consumed, and again when EOS is
-        // consumed (each EOS return counts as consumption).
+    fn con_poll_read_pre_wakes_on_consume_not_on_eof() {
+        // Pre-wake when an item is consumed, but NOT on end-of-stream:
+        // EOF is idempotent and must not pre-wake (per the con_poll_* contract).
         let r = TestExchange::new();
         let cw = CountWaker::new();
         let w: std::task::Waker = cw.clone().into();
@@ -603,6 +607,14 @@ mod tests {
             Poll::Ready(Ok(None)) => {}
             other => panic!("expected Ready(None), got {:?}", other),
         }
-        assert!(cw.count() > 0, "consuming EOS must pre-wake");
+        assert_eq!(cw.count(), 0, "EOF is idempotent and must not pre-wake");
+
+        // EOF is repeatable and remains idempotent — still no pre-wake.
+        cw.reset();
+        match r.con_poll_read(&mut cx) {
+            Poll::Ready(Ok(None)) => {}
+            other => panic!("expected repeated Ready(None), got {:?}", other),
+        }
+        assert_eq!(cw.count(), 0, "repeated EOF must not pre-wake either");
     }
 }

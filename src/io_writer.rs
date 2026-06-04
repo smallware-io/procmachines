@@ -10,6 +10,8 @@ use core::task::{Context, Poll};
 
 use bytes::Bytes;
 
+use crate::RefLockable;
+
 /// A single-producer polling trait for sending bytes into an async stream.
 ///
 /// All methods take `&self` (interior mutability), so the writer and its
@@ -40,7 +42,7 @@ use bytes::Bytes;
 /// Because these methods are single-producer, implementations typically
 /// keep a single waker slot for the producing task.  Registering a new
 /// waker may drop any previously registered waker without notification.
-pub trait IoWriter: Send {
+pub trait IoWriter {
     /// The error type returned by write operations.
     type Error;
 
@@ -78,4 +80,31 @@ pub trait IoWriter: Send {
     ///
     /// Returns `Poll::Ready(Ok(()))` once the close is fully acknowledged.
     fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+impl<T, U> IoWriter for T
+where
+    T: RefLockable<Target = U> + ?Sized,
+    U: IoWriter + ?Sized,
+{
+    type Error = U::Error;
+
+    fn prod_poll_write(
+        &self,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<Result<usize, Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_write(cx, bytes)
+    }
+
+    fn prod_poll_flush(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_flush(cx)
+    }
+
+    fn prod_poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let guard = self.lock_ref();
+        guard.prod_poll_close(cx)
+    }
 }

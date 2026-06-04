@@ -42,6 +42,7 @@ impl WakerRef {
     /// Records `waker` as the task to notify on the next [`wake`](Self::wake)
     /// call, replacing any previously registered waker unless the new one
     /// already wakes the same task.
+    #[inline]
     pub fn register(&self, waker: &Waker) {
         match self.waker.take() {
             Some(prev) if prev.will_wake(waker) => {
@@ -54,6 +55,7 @@ impl WakerRef {
     }
 
     /// Wakes the registered waker, if any, and clears the slot.
+    #[inline(always)]
     pub fn wake(&self) {
         if let Some(w) = self.waker.take() {
             w.wake();
@@ -61,6 +63,7 @@ impl WakerRef {
     }
 
     /// Removes and returns the registered waker, if any, without waking it.
+    #[inline(always)]
     pub fn take(&self) -> Option<Waker> {
         self.waker.take()
     }

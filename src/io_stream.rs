@@ -14,6 +14,8 @@ use core::{
 
 use futures::{Stream, StreamExt};
 
+use crate::RefLockable;
+
 /// A `Stream`-like trait with interior mutability (`&self` receivers).
 ///
 /// Provides async item consumption through shared references. Paired with
@@ -29,22 +31,18 @@ use futures::{Stream, StreamExt};
 ///   registered to be woken later when the same call might return
 ///   [`Poll::Ready`].
 /// - If a `con_poll*` method returns [`Poll::Ready`] **and the return value
-///   indicates that something was actually consumed**, the calling task is
-///   **immediately pre-woken** so it will be re-polled after processing
-///   the output.  This is the opposite of the `prod_poll*` contract on
-///   [`IoSink`](crate::io_sink::IoSink): consumers are expected to drain in
-///   a loop, so a consuming `Ready` keeps the task scheduled to consume
-///   more.
-/// - A `Poll::Ready` that does **not** consume anything does not pre-wake,
-///   but there are no non-consuming `Ready` return values for `con_poll_read`,
-///   so this only applies to other interfaces.
-///
-/// End-of-stream — [`Poll::Ready(None)`](Poll::Ready) from
-/// [`con_poll_read`](IoStream::con_poll_read) — is treated as consumption
-/// for the purposes of this contract: each call consumes one repetition of
-/// the EOS signal and pre-wakes the caller.  The signal is repeatable, so
-/// it is the caller's responsibility to recognise end-of-stream and break
-/// out of any loop that would otherwise consume it forever.
+///   indicates that something was actually consumed** (a non-idempotent
+///   result, e.g. an item), the calling task is **immediately pre-woken** so
+///   it will be re-polled after processing the output.  This is the opposite
+///   of the `prod_poll*` contract on [`IoSink`](crate::io_sink::IoSink):
+///   consumers are expected to drain in a loop, so a consuming `Ready` keeps
+///   the task scheduled to consume more.
+/// - A `Poll::Ready` that does **not** consume anything is idempotent and does
+///   **not** pre-wake.  In particular, end-of-stream
+///   ([`Poll::Ready(Ok(None))`](Poll::Ready)) is idempotent: repeated calls
+///   keep returning end-of-stream, so it never pre-wakes (doing so would spin
+///   the task forever).  It is the caller's responsibility to recognise
+///   end-of-stream and break out of its read loop.
 pub trait IoStream {
     /// The type of items produced by the stream.
     type Item;
@@ -56,8 +54,8 @@ pub trait IoStream {
     /// Returns:
     /// - `Poll::Ready(Some(item))` — an item was consumed; the caller is
     ///   pre-woken to drain more.
-    /// - `Poll::Ready(None)` — end-of-stream.  Each call consumes one
-    ///   repetition of this repeatable signal and pre-wakes the caller;
+    /// - `Poll::Ready(None)` — end-of-stream.  This is idempotent and does
+    ///   **not** pre-wake; repeated calls keep returning end-of-stream, so
     ///   the caller must recognise EOS and break its read loop.
     /// - `Poll::Pending` — no item is available yet.  The waker will be notified
     ///   when the state changes.
@@ -69,6 +67,25 @@ pub trait IoStream {
     /// been dropped and will receive appropriate errors on subsequent sends.
     /// Any in-flight item is discarded.
     fn drop_read(&self);
+}
+
+impl<T, U> IoStream for T
+where
+    T: RefLockable<Target = U> + ?Sized,
+    U: IoStream + ?Sized,
+{
+    type Item = U::Item;
+    type Error = U::Error;
+
+    fn con_poll_read(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+        let guard = self.lock_ref();
+        guard.con_poll_read(cx)
+    }
+
+    fn drop_read(&self) {
+        let guard = self.lock_ref();
+        guard.drop_read()
+    }
 }
 
 /// A wrapper around a [`Stream`] that implements the [`IoStream`] trait.
@@ -91,6 +108,12 @@ impl<STREAM: Stream + Unpin> StreamIoStream<STREAM> {
     }
 }
 
+impl<STREAM> core::fmt::Debug for StreamIoStream<STREAM> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamIoStream").finish_non_exhaustive()
+    }
+}
+
 impl<STREAM, ITEM, ERR> IoStream for StreamIoStream<STREAM>
 where
     STREAM: Stream<Item = Result<ITEM, ERR>> + Unpin,
@@ -108,14 +131,15 @@ where
                     Poll::Ready(Ok(Some(item)))
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // Surface the error and transition to EOF.
+                    // Pre-wake the task, since the error is consumed
                     *inner = None; // Transition to EOF state
                     cx.waker().wake_by_ref();
                     Poll::Ready(Err(e))
                 }
                 Poll::Ready(None) => {
-                    // End-of-stream; consume the signal and pre-wake the caller.
+                    // End-of-stream is idempotent, so do not pre-wake.
                     *inner = None; // Transition to EOF state
-                    cx.waker().wake_by_ref();
                     Poll::Ready(Ok(None))
                 }
                 Poll::Pending => Poll::Pending,
